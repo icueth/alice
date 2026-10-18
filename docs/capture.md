@@ -657,4 +657,7 @@ Answers:
   and try again at the next event: the file itself is the queue.
 
 The tenant script sends at most 2 MiB at a time, doubles the size (up to 8 MiB) when a capped body held no complete
-turn, adds `more=1` whenever a body is as long as its cap, and sends the empty `session-end` at most once per event.
+turn, adds `more=1` whenever a body is as long as its cap, and sends the empty `session-end` at most once per event. At
+a session start it also sweeps up to five other transcripts: one that grew while no event sent it, and one the server
+took nothing from (a hold) that has not changed for 6 hours, which it sends once as `session-end` (the session was left
+in the middle of a turn, and its own `SessionEnd` will never come).

@@ -46,8 +46,8 @@
 #   capture.conf       briefing=on|off
 #   state/<agent>-<session>[-<agent_id>].offset   (<agent> is claude-code or codex)
 #                      "<offset> <path>", then session, subagent, cwd, seen (when the transcript
-#                      was last there), and hold/stopped lines; its mtime is set back to 1971
-#                      while work is left, so a sweep sees the transcript as newer
+#                      was last there), and hold/closed/stopped lines; its mtime is set back to
+#                      1971 while work is left, so a sweep sees the transcript as newer
 #   state/<key>.lock/  pid and at (refreshed every pass) of the worker sending that transcript
 #   state/update.lock/ pid and at of the worker running the update check
 #   capture.log        at most 256 KB; never the token, never transcript text
@@ -87,6 +87,8 @@ BODY_START=2097152
 BODY_MAX=8388608
 PASSES=16
 SWEEP_MAX=5
+# Minutes a held transcript must stay unchanged before the sweep closes it as a session end.
+ABANDONED_MIN=360
 NL='
 '
 SOH=$(printf '\001')
@@ -398,11 +400,12 @@ brief() {
 
 # ---- The background worker ----
 
-# Reads state file $1 into s_off s_path s_session s_sub s_cwd s_seen s_hold s_stopped (1 if
-# absent). A corrupt offset counts as 0 (the server then says where to resume) and a corrupt hold
-# as none; s_corrupt names what was dropped.
+# Reads state file $1 into s_off s_path s_session s_sub s_cwd s_seen s_hold s_closed s_stopped
+# (1 if absent). A corrupt offset counts as 0 (the server then says where to resume) and a corrupt
+# hold as none; s_corrupt names what was dropped. A corrupt closed counts as none (at worst, one
+# more close of an abandoned transcript).
 read_state() {
-  s_off=0 s_path= s_session= s_sub= s_cwd= s_seen= s_hold= s_stopped= s_corrupt=
+  s_off=0 s_path= s_session= s_sub= s_cwd= s_seen= s_hold= s_closed= s_stopped= s_corrupt=
   [ -f "$1" ] || return 1
   rs_first=1
   while IFS= read -r rs_line || [ -n "$rs_line" ]; do
@@ -418,17 +421,20 @@ read_state() {
       "cwd "*) s_cwd=${rs_line#cwd } ;;
       "seen "*) s_seen=${rs_line#seen } ;;
       "hold "*) s_hold=${rs_line#hold } ;;
+      "closed "*) s_closed=${rs_line#closed } ;;
       "stopped "*) s_stopped=${rs_line#stopped } ;;
     esac
   done <"$1"
   if ! offset_ok "$s_off"; then s_off=0 s_corrupt="its offset"; fi
   if [ -n "$s_hold" ] && ! offset_ok "$s_hold"; then s_hold= s_corrupt="${s_corrupt:+$s_corrupt and }its hold"; fi
+  offset_ok "$s_closed" || s_closed=
   epoch_ok "$s_seen" || s_seen=
   return 0
 }
 
 # Writes the s_* values to state file $1 (written whole, then moved into place). `seen` is
-# now when the transcript exists (or for a new state), else it keeps its last value.
+# now when the transcript exists (or for a new state), else it keeps its last value. `closed` is
+# kept only while it names the hold that stands.
 write_state() {
   if [ -f "$s_path" ] || [ -z "$s_seen" ]; then s_seen=$(date +%s); fi
   {
@@ -438,6 +444,7 @@ write_state() {
     printf 'cwd %s\n' "$s_cwd"
     printf 'seen %s\n' "$s_seen"
     if [ -n "$s_hold" ]; then printf 'hold %s\n' "$s_hold"; fi
+    if [ -n "$s_hold" ] && [ "$s_closed" = "$s_hold" ]; then printf 'closed %s\n' "$s_closed"; fi
     if [ -n "$s_stopped" ]; then printf 'stopped %s\n' "$s_stopped"; fi
   } >"$1.tmp.$$" 2>/dev/null && mv -f "$1.tmp.$$" "$1"
 }
@@ -552,6 +559,11 @@ complete_end() {
   printf '%s' $((ce_size - ce_tail))
 }
 
+# Whether file $1 has not changed for more than ABANDONED_MIN minutes (6 hours).
+abandoned() {
+  [ -n "$(find "$1" -prune -mmin +"$ABANDONED_MIN" 2>/dev/null)" ]
+}
+
 # Sets state file $1's mtime back to 1971: work is left, so any transcript looks newer to a
 # sweep. A successful write gives it the current time again.
 mark_pending() {
@@ -577,7 +589,10 @@ post() {
 # one line longer than the cap), the same offset is sent again with twice the cap, up to 8 MiB,
 # where the server closes a pass that makes no progress and calls a line without an end
 # oversized.
-#   capture_one <key> <event> <session> <agent_id or ""> <path> <cwd> <lock wait seconds>
+#   capture_one <key> <event> <session> <agent_id or ""> <path> <cwd> <lock wait seconds> [<hold>]
+# With <hold>, the call is the sweep's close of an abandoned transcript (event session-end): it is
+# made only while that hold still stands, not closed yet, on a transcript still unchanged for 6
+# hours; once the server has answered it, the hold it leaves is marked closed.
 capture_one() {
   co_key=$1
   co_event=$2
@@ -591,6 +606,14 @@ capture_one() {
   read_state "$co_st" || :
   s_session=$3 s_sub=$4 s_path=$5 s_cwd=$6
   if [ -n "$s_stopped" ]; then
+    unlock
+    return 0
+  fi
+  # Read again under the lock: another worker may have sent more meanwhile, or the session may
+  # have come back.
+  co_close=${8:-}
+  if [ -n "$co_close" ] && { [ "$s_hold" != "$co_close" ] || [ "$s_closed" = "$co_close" ] ||
+    [ "$(fsize "$s_path")" -gt "$co_close" ] || ! abandoned "$s_path"; }; then
     unlock
     return 0
   fi
@@ -647,6 +670,7 @@ capture_one() {
   co_lost=
   co_ended=
   co_empty_sent=
+  co_answered=
   while [ "$co_pass" -lt "$PASSES" ]; do
     co_pass=$((co_pass + 1))
     co_empty=
@@ -692,6 +716,7 @@ capture_one() {
     co_next=$(sed -n 's/.*"next_offset"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$tmpd/answer" 2>/dev/null | head -n 1)
     case $co_code in
       200)
+        co_answered=1
         # The answer says whether this upload ended the session (a session end that landed).
         co_end_note=
         if grep -q '"ended"[[:space:]]*:[[:space:]]*true' "$tmpd/answer" 2>/dev/null; then
@@ -790,6 +815,7 @@ capture_one() {
         break
         ;;
       400 | 413)
+        co_answered=1
         co_kind=$(sed -n 's/.*"kind"[[:space:]]*:[[:space:]]*"\([a-z_]*\)".*/\1/p' "$tmpd/answer" 2>/dev/null | head -n 1)
         log "session $3: the server refused the upload (HTTP $co_code ${co_kind:-}); it is sent again when the transcript grows"
         s_hold=$co_size
@@ -818,12 +844,16 @@ capture_one() {
     { [ -z "$s_hold" ] || [ "$(fsize "$s_path")" -gt "$s_hold" ]; }; then
     co_pending=1 # out of passes with bytes left
   fi
+  # A close is sent once per hold: once the server answered it, a hold it leaves (it took nothing
+  # either, or refused it) is closed. Unanswered (the server down), the next sweep sends it again.
+  if [ -n "$co_close" ] && [ -n "$co_answered" ]; then s_closed=$s_hold; fi
   if save_state "$co_st" && [ -n "$co_pending" ]; then mark_pending "$co_st"; fi
   unlock
   return 0
 }
 
-# SessionStart: finish up to five other transcripts that grew while nothing sent them.
+# SessionStart: finish up to five other transcripts that grew while nothing sent them, or that
+# were left held for 6 hours.
 sweep() {
   sw_n=0
   for sw_st in "$STATE"/*.offset; do
@@ -845,9 +875,20 @@ sweep() {
       if [ -n "$s_seen" ] && [ $(($(date +%s) - s_seen)) -gt 604800 ]; then rm -f "$sw_st"; fi
       continue
     fi
+    sw_size=$(fsize "$s_path")
+    # Held (the server took nothing, and the transcript has not grown past the hold) and
+    # unchanged for 6 hours: the session was left mid-turn (a crash, a kill, a closed app), and
+    # no event will send it again. It is closed as the SessionEnd that never came, which makes the
+    # server take the trailing turn and end the source; once per hold.
+    if [ -n "$s_hold" ] && [ "$sw_size" -le "$s_hold" ] && [ "$sw_size" -gt "$s_off" ] &&
+      [ "$s_closed" != "$s_hold" ] && abandoned "$s_path"; then
+      capture_one "$sw_key" session-end "$s_session" "$s_sub" "$s_path" "$s_cwd" 0 "$s_hold"
+      sw_n=$((sw_n + 1))
+      [ "$sw_n" -lt "$SWEEP_MAX" ] || break
+      continue
+    fi
     # Untouched since its state was written (and no work left, see mark_pending): skip.
     [ "$s_path" -nt "$sw_st" ] || continue
-    sw_size=$(fsize "$s_path")
     [ "$sw_size" -gt "$s_off" ] || continue
     if [ -n "$s_hold" ] && [ "$sw_size" -le "$s_hold" ]; then continue; fi
     capture_one "$sw_key" sweep "$s_session" "$s_sub" "$s_path" "$s_cwd" 0

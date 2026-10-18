@@ -2192,6 +2192,383 @@ async fn session_end_sends_once_past_a_hold() {
     assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
 }
 
+/// Sets `path`'s modification time to `age` ago (a transcript idle that long, without waiting).
+fn set_age(path: &Path, age: Duration) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+/// A session whose turn 1 is complete and whose turn 2 ends on a tool call that never got its
+/// result: after a `Stop` (two uploads: turn 1 is taken, then turn 2 alone is not) the server
+/// keeps turn 2 open, and the state holds at the file's size. Also returns where turn 2 starts
+/// (the server's cursor).
+fn held_session(env: &Env, id: &str, cwd: &Path) -> (Session, u64) {
+    let mut sess = Session::new(env, id, cwd);
+    sess.turn(1, &format!("{id} first answer"));
+    let second = sess.tr.len();
+    sess.tr
+        .prompt(&format!("{id}-p2"), "Run the long job.")
+        .line(json!({"type": "assistant", "uuid": format!("{id}-a2"),
+            "message": {"id": format!("msg-{id}-a2"), "role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("toolu_{id}"), "name": "Bash",
+                 "input": {"command": format!("sleep {id}")}}]}}));
+    sess.flush();
+    env.hook(&sess.input("Stop"));
+    (sess, second)
+}
+
+/// The `hold` line of state file `key`.
+fn hold_of(env: &Env, key: &str) -> Option<u64> {
+    read(&env.state_file(key))
+        .lines()
+        .find_map(|l| l.strip_prefix("hold ")?.parse().ok())
+}
+
+/// Follow-up (capture gaps): a session killed mid-turn (a crash, a kill, a closed app) leaves a
+/// held transcript that no event sends again. The sweep (at a SessionStart) closes one that has
+/// not changed for 6 hours with a `session-end`, as the event that never came: the server takes
+/// the trailing turn and ends the source. One younger than 6 hours stays held, and one that grew
+/// past its hold is sent as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweep_closes_a_transcript_held_unchanged_for_six_hours() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    let (old, old_second) = held_session(&env, "heldold", &cwd);
+    let (young, _) = held_session(&env, "heldyoung", &cwd);
+    let (mut grown, _) = held_session(&env, "heldgrown", &cwd);
+    env.wait_idle();
+    for sess in [&old, &young, &grown] {
+        assert_eq!(
+            hold_of(&env, &sess.key()),
+            Some(sess.tr.len()),
+            "{}",
+            sess.id
+        );
+        assert_eq!(turns_of(&t.home, &uri(&sess.id)), 1, "{}", sess.id);
+        assert_eq!(uploads(&s, &sess.id).len(), 2, "{}", sess.id);
+    }
+    set_age(&old.path, Duration::from_secs(6 * 3600 + 120));
+    set_age(&young.path, Duration::from_secs(6 * 3600 - 600));
+    // A minute after the hold, the tool's result and the reply arrive, but no event sends them.
+    set_age(&env.state_file(&grown.key()), Duration::from_secs(60));
+    grown
+        .tr
+        .line(json!({"type": "user", "uuid": "heldgrown-r2",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_heldgrown", "content": "done"}]}}))
+        .reply("heldgrown-a2b", "The long job finished.");
+    grown.flush();
+
+    let next = Session::new(&env, "heldnext", &cwd);
+    env.hook(&next.input("SessionStart"));
+    env.wait_idle();
+    let ups = uploads(&s, "heldold");
+    assert_eq!(ups.len(), 3, "{ups:?}\n{}", env.log());
+    assert_eq!(ups[2]["event"], "session-end");
+    assert_eq!(ups[2]["offset"], old_second.to_string());
+    assert_eq!(turns_of(&t.home, &uri("heldold")), 2);
+    assert_eq!(chunks_holding(&t.home, "sleep heldold"), 1);
+    assert!(source_ended(&t.home, &uri("heldold")));
+    assert_eq!(env.offset(&old.key()), Some(old.tr.len()));
+    assert_eq!(hold_of(&env, &old.key()), None);
+
+    assert_eq!(uploads(&s, "heldyoung").len(), 2, "{}", env.log());
+    assert_eq!(turns_of(&t.home, &uri("heldyoung")), 1);
+    assert_eq!(hold_of(&env, &young.key()), Some(young.tr.len()));
+
+    let ups = uploads(&s, "heldgrown");
+    assert_eq!(ups.len(), 3, "{ups:?}");
+    assert_eq!(ups[2]["event"], "sweep");
+    assert_eq!(turns_of(&t.home, &uri("heldgrown")), 2);
+    assert!(!source_ended(&t.home, &uri("heldgrown")));
+    assert_eq!(env.offset(&grown.key()), Some(grown.tr.len()));
+
+    // A later sweep sends none of them again.
+    let last = Session::new(&env, "heldlast", &cwd);
+    env.hook(&last.input("SessionStart"));
+    env.wait_idle();
+    for (id, n) in [("heldold", 3), ("heldyoung", 2), ("heldgrown", 3)] {
+        assert_eq!(uploads(&s, id).len(), n, "{id}: {}", env.log());
+    }
+}
+
+/// Follow-up (capture gaps): the close of an abandoned transcript is sent once per hold. When the
+/// server takes nothing from it either (here a subagent too short to judge), the hold is marked
+/// closed and no later sweep sends it again; when the transcript grows, it is sent as before. A
+/// session closed this way that is resumed later goes on: the new lines are taken, the source is
+/// open again (new turns clear `ended`), and nothing is stored twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_is_sent_once_per_hold_and_a_resumed_session_goes_on() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    let (mut main, _) = held_session(&env, "resumed", &cwd);
+    // A subagent of it too short to judge: the server keeps it at offset 0.
+    let sub_path = env
+        .root
+        .join("transcripts/resumed/subagents/agent-agent7.jsonl");
+    std::fs::create_dir_all(sub_path.parent().unwrap()).unwrap();
+    let mut tiny = Transcript::subagent("agent7");
+    tiny.prompt("resumed-agent7-p", "Suggest a title.")
+        .reply("resumed-agent7-a", "Fine.");
+    std::fs::write(&sub_path, &tiny.bytes).unwrap();
+    let mut sub_input = main.input("SubagentStop");
+    sub_input["agent_id"] = json!("agent7");
+    sub_input["agent_type"] = json!("general-purpose");
+    sub_input["agent_transcript_path"] = json!(sub_path);
+    env.hook(&sub_input);
+    env.wait_idle();
+    let sub_key = "claude-code-resumed-agent7";
+    let sub_ups = || {
+        uploads(&s, "resumed")
+            .into_iter()
+            .filter(|q| q.get("subagent").map(String::as_str) == Some("agent7"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(sub_ups().len(), 1);
+    assert_eq!(hold_of(&env, sub_key), Some(tiny.len()));
+    let main_ups = || {
+        uploads(&s, "resumed")
+            .into_iter()
+            .filter(|q| !q.contains_key("subagent"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(main_ups().len(), 2);
+
+    set_age(&main.path, Duration::from_secs(7 * 3600));
+    set_age(&sub_path, Duration::from_secs(7 * 3600));
+    env.hook(&Session::new(&env, "resumednext", &cwd).input("SessionStart"));
+    env.wait_idle();
+    let ups = sub_ups();
+    assert_eq!(ups.len(), 2, "{ups:?}\n{}", env.log());
+    assert_eq!(ups[1]["event"], "session-end");
+    assert_eq!(hold_of(&env, sub_key), Some(tiny.len()), "still held");
+    assert!(
+        read(&env.state_file(sub_key)).contains(&format!("\nclosed {}\n", tiny.len())),
+        "{}",
+        read(&env.state_file(sub_key))
+    );
+    assert_eq!(main_ups().len(), 3);
+    assert_eq!(main_ups()[2]["event"], "session-end");
+    assert!(source_ended(&t.home, &uri("resumed")));
+    assert_eq!(turns_of(&t.home, &uri("resumed")), 2);
+
+    // Not sent again while the hold stands, by later sweeps.
+    env.hook(&Session::new(&env, "resumedthird", &cwd).input("SessionStart"));
+    env.wait_idle();
+    assert_eq!(sub_ups().len(), 2, "{}", env.log());
+    assert_eq!(main_ups().len(), 3);
+
+    // The session is resumed: the tool's result, the reply and a new turn are written, and its
+    // Stop sends them from where the close left the cursor.
+    let closed_at = main.tr.len();
+    main.tr
+        .line(json!({"type": "user", "uuid": "resumed-r2",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_resumed", "content": "lateresultquokka"}]}}))
+        .reply("resumed-a2b", "The long job finished.");
+    main.turn(3, "afterresumequokka");
+    env.hook(&main.input("Stop"));
+    env.wait_idle();
+    let ups = main_ups();
+    assert_eq!(ups.len(), 4, "{ups:?}");
+    assert_eq!(ups[3]["offset"], closed_at.to_string());
+    assert_eq!(env.offset(&main.key()), Some(main.tr.len()));
+    assert!(
+        !source_ended(&t.home, &uri("resumed")),
+        "new turns after the close open the source again"
+    );
+    for marker in [
+        "resumed first answer",
+        "sleep resumed",
+        "lateresultquokka",
+        "afterresumequokka",
+    ] {
+        assert_eq!(chunks_holding(&t.home, marker), 1, "{marker}");
+    }
+
+    // The subagent grows: sent as before, and captured whole.
+    tiny.prompt("resumed-agent7-p2", "Now explain the choice.")
+        .reply(
+            "resumed-agent7-a2",
+            &"The title names the feature and the reason it exists, nothing more. ".repeat(3),
+        );
+    std::fs::write(&sub_path, &tiny.bytes).unwrap();
+    env.hook(&sub_input);
+    env.wait_idle();
+    assert_eq!(sub_ups().len(), 3);
+    assert_eq!(sub_ups()[2]["event"], "subagent-stop");
+    assert_eq!(
+        turns_of(&t.home, "claude-code:session:resumed:agent:agent7"),
+        2
+    );
+    assert_eq!(env.offset(sub_key), Some(tiny.len()));
+}
+
+/// Follow-up (capture gaps): a close the server never answered (it was down) is not counted as
+/// sent: the next sweep sends it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unanswered_close_is_sent_again_by_the_next_sweep() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    let (sess, _) = held_session(&env, "heldoff", &cwd);
+    env.wait_idle();
+    set_age(&sess.path, Duration::from_secs(7 * 3600));
+    s.pause(true);
+    env.hook(&Session::new(&env, "heldoff2", &cwd).input("SessionStart"));
+    env.wait_idle();
+    let ups = uploads(&s, "heldoff");
+    assert_eq!(ups.len(), 3, "{ups:?}");
+    assert_eq!(ups[2]["event"], "session-end");
+    assert_eq!(turns_of(&t.home, &uri("heldoff")), 1);
+    assert!(
+        !read(&env.state_file(&sess.key())).contains("\nclosed "),
+        "{}",
+        read(&env.state_file(&sess.key()))
+    );
+
+    s.pause(false);
+    env.hook(&Session::new(&env, "heldoff3", &cwd).input("SessionStart"));
+    env.wait_idle();
+    let ups = uploads(&s, "heldoff");
+    assert_eq!(ups.len(), 4, "{ups:?}\n{}", env.log());
+    assert_eq!(ups[3]["event"], "session-end");
+    assert_eq!(turns_of(&t.home, &uri("heldoff")), 2);
+    assert!(source_ended(&t.home, &uri("heldoff")));
+}
+
+/// Follow-up (capture gaps): a hold already closed takes none of the sweep's five places, and the
+/// close looks at the state again under the lock: it is not sent once the hold was closed or has
+/// moved on, or the transcript grew or changed since the sweep looked (another worker, or the
+/// session come back).
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_holds_take_no_sweep_place_and_a_close_checks_again_under_the_lock() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    // A transcript of one turn whose tool call has no result, and its state (`extra` lines after
+    // the first three).
+    let held = |id: &str, extra: &str| -> (PathBuf, u64) {
+        let mut sess = Session::new(&env, id, &cwd);
+        sess.tr
+            .prompt(&format!("{id}-p1"), "Run the long job.")
+            .line(json!({"type": "assistant", "uuid": format!("{id}-a1"),
+                "message": {"id": format!("msg-{id}-a1"), "role": "assistant", "content": [
+                    {"type": "tool_use", "id": format!("toolu_{id}"), "name": "Bash",
+                     "input": {"command": format!("sleep {id}")}}]}}));
+        sess.flush();
+        let len = sess.tr.len();
+        let extra = extra.replace("LEN", &len.to_string());
+        std::fs::write(
+            env.state_file(&sess.key()),
+            format!(
+                "0 {}\nsession {id}\ncwd {}\n{extra}",
+                sess.path.display(),
+                cwd.display()
+            ),
+        )
+        .unwrap();
+        set_age(&sess.path, Duration::from_secs(7 * 3600));
+        (sess.path, len)
+    };
+    // Five of each: closed already, held but younger than 6 hours, and grown past the hold (no
+    // close: the transcript holds more than the server was asked about). None is the sweep's to
+    // close, so none takes one of its five places.
+    for i in 0..5 {
+        held(&format!("aclosed{i}"), "hold LEN\nclosed LEN\n");
+        let (young, _) = held(&format!("ayoung{i}"), "hold LEN\n");
+        set_age(&young, Duration::from_secs(5 * 3600));
+        let (bigger, _) = held(&format!("agrown{i}"), "hold LEN\n");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&bigger)
+            .unwrap()
+            .write_all(b"{\"type\":\"mode\",\"mode\":\"default\",\"sessionId\":\"x\"}\n")
+            .unwrap();
+        set_age(&bigger, Duration::from_secs(7 * 3600));
+    }
+    // Sorted after them: a transcript no event sent, newer than its state.
+    let mut grown = Session::new(&env, "zgrown", &cwd);
+    grown.turn(1, "grownquokka");
+    std::fs::write(
+        env.state_file(&grown.key()),
+        format!(
+            "0 {}\nsession zgrown\ncwd {}\n",
+            grown.path.display(),
+            cwd.display()
+        ),
+    )
+    .unwrap();
+    set_age(&env.state_file(&grown.key()), Duration::from_secs(60));
+    env.hook(&Session::new(&env, "znext", &cwd).input("SessionStart"));
+    env.wait_idle();
+    let ups = uploads(&s, "zgrown");
+    assert_eq!(ups.len(), 1, "{}", env.log());
+    assert_eq!(ups[0]["event"], "sweep");
+    for i in 0..5 {
+        for kind in ["aclosed", "ayoung", "agrown"] {
+            assert!(uploads(&s, &format!("{kind}{i}")).is_empty(), "{kind}{i}");
+        }
+    }
+
+    // The close itself, as the sweep calls it, after the state or the file moved on.
+    let (closed, closed_len) = held("bclosed", "hold LEN\nclosed LEN\n");
+    let (moved, moved_len) = held("bmoved", "");
+    let (young, young_len) = held("byoung", "hold LEN\n");
+    set_age(&young, Duration::from_secs(60));
+    let (bigger, bigger_len) = held("bgrown", "hold LEN\n");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&bigger)
+        .unwrap()
+        .write_all(b"{\"type\":\"mode\",\"mode\":\"default\",\"sessionId\":\"bgrown\"}\n")
+        .unwrap();
+    set_age(&bigger, Duration::from_secs(7 * 3600));
+    let (ready, ready_len) = held("bready", "hold LEN\n");
+    let call = |id: &str, path: &Path, hold: u64| {
+        format!(
+            "capture_one claude-code-{id} session-end {id} '' '{}' '{}' 0 {hold}\n",
+            path.display(),
+            cwd.display()
+        )
+    };
+    let script = [
+        "load_credentials || exit 9\n".to_string(),
+        call("bclosed", &closed, closed_len),
+        call("bmoved", &moved, moved_len),
+        call("byoung", &young, young_len),
+        call("bgrown", &bigger, bigger_len),
+        call("bready", &ready, ready_len),
+    ]
+    .concat();
+    let r = with_hook_lib(&env, &script, Duration::from_secs(60));
+    assert!(r.ok(), "{r}");
+    for id in ["bclosed", "bmoved", "byoung", "bgrown"] {
+        assert!(uploads(&s, id).is_empty(), "{id}: {}", env.log());
+    }
+    let ups = uploads(&s, "bready");
+    assert_eq!(ups.len(), 1, "{}", env.log());
+    assert_eq!(ups[0]["event"], "session-end");
+    assert_eq!(turns_of(&t.home, &uri("bready")), 1);
+    assert!(source_ended(&t.home, &uri("bready")));
+    assert_eq!(env.offset("claude-code-bready"), Some(ready_len));
+}
+
 /// Merge fix round 1: a `SessionEnd` after a `Stop` that sent the whole file still reaches the
 /// server, as one empty upload at the offset. The source ends and is marked due for distillation.
 #[tokio::test(flavor = "multi_thread")]
