@@ -1432,6 +1432,71 @@ impl Rollout {
                    "output": [{"type": "input_text", "text": text}]}),
         )
     }
+
+    /// A multi-agent message from `author` to `recipient`, with the metadata line before it
+    /// and, when `encrypted`, an opaque block after the text.
+    fn agent(&mut self, author: &str, recipient: &str, text: &str, encrypted: bool) -> &mut Self {
+        let mut content = vec![json!({"type": "input_text", "text": text})];
+        if encrypted {
+            content.push(json!({"type": "encrypted_content", "encrypted_content": "ZW5j"}));
+        }
+        let id = format!("am{}", self.clock);
+        self.line(
+            "inter_agent_communication_metadata",
+            json!({"trigger_turn": true}),
+        )
+        .line(
+            "response_item",
+            json!({"type": "agent_message", "id": id,
+                   "author": author, "recipient": recipient, "content": content,
+                   "internal_chat_message_metadata_passthrough": {"turn_id": "t1"}}),
+        )
+    }
+}
+
+/// Follow-up 2: a Codex multi-agent session's agent messages are captured as blocks of their turn
+/// (`[agent <author> → <recipient>]`), and none of their lines is counted as unrecognised or as
+/// bookkeeping, so `alice doctor` no longer warns about them.
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_agent_messages_are_captured_and_never_counted_as_drift() {
+    let (_d, svc) = tenant();
+    let mut r = Rollout::default();
+    r.line(
+        "session_meta",
+        json!({"id": "cxa", "cwd": "/home/user/project-x"}),
+    )
+    .prompt("Ask a reviewer to check the parser change.")
+    .reply("Starting a reviewer.")
+    .agent(
+        "/root/review_w1",
+        "/root",
+        "Reviewer one: agentquokka, no findings.",
+        true,
+    )
+    .line(
+        "response_item",
+        json!({"type": "agent_message", "author": "/root/review_w1", "recipient": "/root",
+               "content": [{"type": "encrypted_content", "encrypted_content": "b3Bh"}]}),
+    )
+    .reply("The review found nothing to fix.");
+    let a = send(&svc, codex_q("cxa", 0, "session-end"), &r.bytes).await;
+    assert_eq!((a.turns_stored, a.next_offset), (1, r.len()));
+    let texts: Vec<String> = chunks_of(&svc, "codex:session:cxa")
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("[agent /root/review_w1 → /root] Reviewer one: agentquokka")),
+        "{texts:?}"
+    );
+    let h = svc.health().await.unwrap().capture.unwrap();
+    assert_eq!(
+        (h.unrecognised_lines_7d, h.bookkeeping_lines_7d),
+        (0, 0),
+        "{h:?}"
+    );
 }
 
 fn codex_q(session: &str, offset: u64, event: &str) -> TranscriptQuery {

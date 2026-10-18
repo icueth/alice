@@ -60,6 +60,13 @@ pub(crate) enum Block {
     Image,
     Document,
     Audio,
+    /// A message between agents of a multi-agent session (Codex `agent_message`), with the
+    /// agents' paths (`/root`, `/root/<name>`): `[agent <author> → <recipient>] <text>`.
+    AgentMessage {
+        author: String,
+        recipient: String,
+        text: String,
+    },
     /// The stub of a line over `MAX_LINE_BYTES`: `[record skipped: too large]`.
     TooLarge,
 }
@@ -149,7 +156,9 @@ impl Record {
             .iter()
             .find_map(|block| match block {
                 Block::Text(text) | Block::Thinking(text) => Some(text.as_str()),
-                Block::ToolResult { text, .. } => Some(text.as_str()),
+                Block::ToolResult { text, .. } | Block::AgentMessage { text, .. } => {
+                    Some(text.as_str())
+                }
                 Block::ToolUse { name, .. } => Some(name.as_str()),
                 _ => None,
             })

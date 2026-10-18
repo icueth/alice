@@ -59,17 +59,27 @@ names and counts, no values) found two shapes this table lacks, 40 lines each, i
 | line `type` | `payload.type` | payload fields | Alice |
 |---|---|---|---|
 | `inter_agent_communication_metadata` | none | `trigger_turn` | known, dropped (bookkeeping) |
-| `response_item` | `agent_message` | `id`, `author`, `recipient`, `content[]` (`{type: "input_text", text}`, and in 30 of 40 also `{type: "encrypted_content", encrypted_content}`), `internal_chat_message_metadata_passthrough` | not read yet: counted as unrecognised |
+| `response_item` | `agent_message` | `id`, `author`, `recipient`, `content[]` (`{type: "input_text", text}`, and in 30 of 40 also `{type: "encrypted_content", encrypted_content}`), `internal_chat_message_metadata_passthrough {turn_id, create_time}` | read (follow-up 2), see below |
 
-`agent_message` carries text (a message between agents), so it is not bookkeeping; reading it needs a sampled
-fixture first.
+**Multi-agent sessions.** A second names-only scan (2026-10-18, 36 rollouts) showed how they are laid out. Each
+agent writes its own rollout. A sub-agent's `session_meta` has `thread_source: "subagent"`, `source: {subagent}`,
+`parent_thread_id`, `agent_path` and `agent_nickname` (9 such rollouts; the root's has `thread_source: "user"`).
+`author` and `recipient` are agent paths: in the root's rollout, the sub-agents' messages to it
+(`/root/review_w1` → `/root`); in a sub-agent's rollout, the root's messages to it (`/root` → `/root/review_w1`).
+The text is 72 to 2,646 characters. An `inter_agent_communication_metadata` line comes before each message.
+
+Alice reads an `agent_message` as a block of the turn it occurs in, rendered
+`[agent <author> → <recipient>] <text>` (the text blocks joined by a line break). It never starts a turn.
+`encrypted_content` is opaque and skipped, so a message holding only that leaves nothing, and it is not drift. Any
+other block type beside them is drift, as in a `message`. The text goes through the same redaction and cuts as an
+assistant's. `agent_messages.jsonl` is a synthetic rollout (no real text) of one root turn with two sub-agents'
+messages, one of them encrypted only.
 
 As for Claude Code, Alice drops a line of a top-level `type` it does not know as **bookkeeping**, counted apart
 and never as drift, only when none of these keys appears in it at any depth, its `payload` and the arrays in it
 included: `message`, `content`, `text`, `summary`, `arguments`, `input`, `output`, `prompt`, `command`, `result`, `error`, `thinking`, `reasoning` (the keys Codex keeps tool calls and outputs under, `arguments`, `input` and `output`,
 among them). With such a key anywhere, or with a `payload` that is not an object, the line counts as unrecognised.
-An unknown `payload.type` of a known line type (`response_item`, as `agent_message` is) always counts as
-unrecognised.
+An unknown `payload.type` of a known line type (`response_item`, say) always counts as unrecognised.
 
 ### `response_item.message` content blocks
 

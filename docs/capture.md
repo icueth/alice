@@ -59,6 +59,7 @@ so the format is fixed:
 [result error] <trimmed output>
 [summary] <compaction summary>
 [subagent general-purpose] <the subagent's final report>
+[agent /root/review_w1 → /root] <a Codex agent's message to another>
 ```
 
 | Content | What is stored |
@@ -73,6 +74,7 @@ so the format is fixed:
 | Grep, Glob, LS | The pattern and the first 300 characters of the result |
 | WebFetch, WebSearch | The URL or query and the first 500 characters of the result |
 | A subagent call (Task, Agent) | `[subagent <type>] <description>`, then its final report, at most 2,000 characters |
+| A message between agents of a Codex multi-agent session | `[agent <author> → <recipient>] <text>`, with the agents' paths (`/root`, `/root/<name>`); an opaque `encrypted_content` part is never stored |
 | TodoWrite and similar bookkeeping | Dropped |
 | Alice's and MemPalace's own memory tools | `[tool alice remember] <title, at most 120 characters>`, and the result as `[result] [omitted: memory tool]`. Memory text never comes back into the raw tier |
 | Other tools | The input as compact JSON (at most 300 characters) and the output, trimmed |
