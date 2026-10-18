@@ -49,10 +49,15 @@ find it instead: Alice looks for the subagent transcripts Claude Code wrote besi
 (`<session>/subagents/agent-<id>.jsonl`) that it has no source for, at most five per event, so a session with more is
 finished over later events. Locally that happens at each pass of the session and at the daemon's sweep; on a server
 tenant at the session's `Stop`, `PreCompact`, `SessionEnd` and `SessionStart`, and at every session start for every
-captured session. A subagent found this way follows the same rules as any source, the 6-hour close included, and a
-`SubagentStop` that comes later goes on from where it stopped. A Codex sub-agent writes a rollout of its own; its
-`SubagentStop` names it, and that rollout is its own source (`codex:session:<id>:agent:<agent-id>`). A Codex sub-agent
-killed before its `SubagentStop` is not found yet: its rollout lies in the date folders under its own thread id.
+captured session, for a file unchanged for 5 minutes (one still running is left to its own `SubagentStop`, so its turn
+is not cut in two). A subagent found this way follows the same rules as any source: one too short to keep (under 200
+characters in all, its open turn included) is never stored, the 6-hour close applies, and a `SubagentStop` that comes
+later goes on from where it stopped. A Codex sub-agent writes a rollout of its own; its `SubagentStop` names it, and
+that rollout is its own source. On a server tenant it is known by the rollout's own id (the thread id its file name ends
+with, which its first line holds), so a second sub-agent Codex gives the same `agent_id` gets a source of its own,
+read from its start (`codex:session:<id>:agent:<rollout id>`); locally by its `agent_id`, a changed file being read
+again from its start. A Codex sub-agent killed before its `SubagentStop` is not found yet: its rollout lies in the date
+folders under its own thread id.
 
 **Exactly once.** Every stored turn records a key (the id of its first record). A turn whose key is already stored, in any
 source, is skipped. That covers a hook that fires twice, a daemon killed in the middle of a pass, a forked session that

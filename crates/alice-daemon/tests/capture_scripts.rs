@@ -1786,7 +1786,8 @@ async fn a_sweep_does_not_pair_a_vanished_codex_rollout_with_another_file() {
 /// The transcript of subagent `agent` of session `sess`, where Claude Code writes it:
 /// `<session transcript without .jsonl>/subagents/agent-<id>.jsonl`. Its one turn is complete
 /// and long enough to keep (over 200 characters), naming `marker`; with `held`, it ends instead on
-/// a tool call that never got its result.
+/// a tool call that never got its result. It was last written 10 minutes ago, as a killed one's
+/// is (the search leaves a file changed in the last 5 minutes to its own SubagentStop).
 fn subagent_file(sess: &Session, agent: &str, marker: &str, held: bool) -> (PathBuf, Transcript) {
     let path = sess
         .path
@@ -1817,6 +1818,7 @@ fn subagent_file(sess: &Session, agent: &str, marker: &str, held: bool) -> (Path
         );
     }
     std::fs::write(&path, &t.bytes).unwrap();
+    set_age(&path, Duration::from_secs(10 * 60));
     (path, t)
 }
 
@@ -1912,6 +1914,57 @@ async fn a_session_with_many_lost_subagents_is_finished_over_several_events() {
     assert_eq!(uploads(&s, "many").len(), before);
 }
 
+/// Lane 2 fix round 1, review M1 and M6. A subagent file changed in the last 5 minutes is left to
+/// its own SubagentStop: one still running (a background agent) does not have its trailing turn
+/// closed mid-way by its session's Stop. Once it has been quiet for 5 minutes (killed), the next
+/// event sends it. And a token the server refuses during the search stops the search at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_search_leaves_a_running_subagent_alone_and_stops_on_a_refused_token() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    let mut main = Session::new(&env, "running", &cwd);
+    main.turn(1, "the main session");
+    let (sub_path, _) = subagent_file(&main, "agentr1", "runningsubquokka", false);
+    set_age(&sub_path, Duration::from_secs(60));
+    env.hook(&main.input("Stop"));
+    env.wait_idle();
+    let key = "claude-code-running-agentr1";
+    assert!(!env.state_file(key).exists(), "{}", env.log());
+    set_age(&sub_path, Duration::from_secs(6 * 60));
+    main.turn(2, "the main session goes on");
+    env.hook(&main.input("Stop"));
+    env.wait_idle();
+    assert_eq!(
+        turns_of(&t.home, &sub_uri("running", "agentr1")),
+        1,
+        "{}",
+        env.log()
+    );
+
+    // Three more, and a token the server refuses: the first refusal stops the search.
+    for i in 0..3 {
+        subagent_file(&main, &format!("agentz{i}"), &format!("refused{i}"), false);
+    }
+    write_mode(
+        &env.alice().join("token"),
+        format!("{}\n", "0".repeat(64)).as_bytes(),
+        0o600,
+    );
+    let before = uploads(&s, "running").len();
+    main.turn(3, "with a stale token");
+    env.hook(&main.input("Stop"));
+    env.wait_idle();
+    assert_eq!(
+        uploads(&s, "running").len(),
+        before + 1,
+        "the session's own upload only: {}",
+        env.log()
+    );
+}
+
 /// Follow-up 2: a found subagent follows the rules of any transcript. Found while the tenant's
 /// rules wait, it is held; the 6-hour close is sent and, while the rules still wait, not marked
 /// closed; once they are known, the next close takes its trailing turn and ends its source.
@@ -1965,9 +2018,10 @@ async fn a_found_subagent_waits_out_the_rules_and_is_closed_after_six_hours() {
 }
 
 /// Follow-up 2: Codex writes each sub-agent's own rollout, and its SubagentStop hook names it
-/// (`agent_id`, `agent_transcript_path`; `session_id` is the parent's). The script now sends it
-/// as the sub-agent's own source, as for Claude Code, instead of sending the parent's rollout. A
-/// sub-agent id that is no valid id falls back to the parent, as before.
+/// (`agent_id`, `agent_transcript_path`; `session_id` is the parent's). The script sends it as the
+/// sub-agent's own source, known by the rollout's own id (the thread id its name ends with, which
+/// its first line holds), whatever `agent_id` looks like (lane 2 fix round 1, I2). A file that is
+/// no rollout of its own id falls back to the parent, as before.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_codex_subagent_stop_sends_the_subagents_own_rollout() {
     let s = Server::start(&["ann"]).await;
@@ -1986,7 +2040,8 @@ async fn a_codex_subagent_stop_sends_the_subagents_own_rollout() {
     );
     let child_path = env.write_rollout("2026/10/16", child, &rollout(child, &[long.as_str()]));
     let mut input = codex_input(parent, json!(parent_path), &work, "SubagentStop");
-    input["agent_id"] = json!(child);
+    // An agent path, which is no valid id: the rollout's own id names the sub-agent.
+    input["agent_id"] = json!("/root/review_w1");
     input["agent_type"] = json!("reviewer");
     input["agent_transcript_path"] = json!(child_path);
     env.codex_hook(&input);
@@ -2001,11 +2056,112 @@ async fn a_codex_subagent_stop_sends_the_subagents_own_rollout() {
     );
     assert!(env.state_file(&format!("codex-{parent}-{child}")).exists());
 
-    // An id that is no valid id: the parent's rollout, as before.
-    input["agent_id"] = json!("/root/review w1");
+    // A file whose first line does not name the id its name gives: the parent's rollout.
+    let odd = env
+        .root
+        .join(format!("rollout-2026-10-16T01-02-03-{child}5.jsonl"));
+    std::fs::write(&odd, rollout("someone-else", &["oddquokka"])).unwrap();
+    input["agent_transcript_path"] = json!(odd);
     env.codex_hook(&input);
     env.wait_idle();
     assert_eq!(chunks_holding(&t.home, "parentquokka"), 1);
+    assert_eq!(chunks_holding(&t.home, "oddquokka"), 0);
+}
+
+/// Lane 2 fix round 1, I2: Codex may give a second sub-agent the `agent_id` of one that finished.
+/// Its new rollout is a state of its own, read from its start: never from the first one's offset,
+/// and never stopped for good. The first rollout again (it grew) goes on from its own offset and
+/// stores nothing twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reused_codex_agent_id_with_a_new_rollout_starts_a_fresh_state() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.install(&s);
+    let work = env.root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let parent = "019f0000-5555-7000-8000-000000000055";
+    let (first, second) = (
+        "019f0000-6666-7000-8000-000000000066",
+        "019f0000-7777-7000-8000-000000000077",
+    );
+    let parent_path = env.write_rollout("2026/10/16", parent, &rollout(parent, &["p1"]));
+    let words = |m: &str| format!("{m} {}", "the reviewer reads every hunk. ".repeat(8));
+    let (one, two, three) = (
+        words("firstagentquokka"),
+        words("moreworkquokka"),
+        words("x"),
+    );
+    let first_text = rollout(first, &[one.as_str(), two.as_str(), three.as_str()]);
+    let first_path = env.write_rollout("2026/10/16", first, &first_text);
+    let stop = |path: &Path| {
+        let mut v = codex_input(parent, json!(parent_path), &work, "SubagentStop");
+        v["agent_id"] = json!("review_w1");
+        v["agent_type"] = json!("reviewer");
+        v["agent_transcript_path"] = json!(path);
+        v
+    };
+    env.codex_hook(&stop(&first_path));
+    env.wait_idle();
+    let uri_of = |id: &str| format!("codex:session:{parent}:agent:{id}");
+    assert_eq!(turns_of(&t.home, &uri_of(first)), 3, "{}", env.log());
+
+    // A second sub-agent under the same agent_id, shorter than the first's offset.
+    let late = words("secondagentquokka");
+    let second_path = env.write_rollout("2026/10/16", second, &rollout(second, &[late.as_str()]));
+    assert!(std::fs::metadata(&second_path).unwrap().len() < first_text.len() as u64);
+    env.codex_hook(&stop(&second_path));
+    env.wait_idle();
+    assert_eq!(turns_of(&t.home, &uri_of(second)), 1, "{}", env.log());
+    assert_eq!(chunks_holding(&t.home, "secondagentquokka"), 1);
+    assert!(!read(&env.state_file(&format!("codex-{parent}-{second}"))).contains("stopped"));
+    assert!(!env.log().contains("capture stopped"), "{}", env.log());
+
+    // The first rollout again, grown: only its new turn.
+    let more = words("lastturnquokka");
+    let grown = rollout(
+        first,
+        &[one.as_str(), two.as_str(), three.as_str(), more.as_str()],
+    );
+    std::fs::write(&first_path, grown).unwrap();
+    env.codex_hook(&stop(&first_path));
+    env.wait_idle();
+    assert_eq!(turns_of(&t.home, &uri_of(first)), 4);
+    for marker in ["firstagentquokka", "moreworkquokka", "lastturnquokka"] {
+        assert_eq!(chunks_holding(&t.home, marker), 1, "{marker}");
+    }
+}
+
+/// Lane 2 fix round 1, review M2: a Codex SubagentStop whose `transcript_path` is null still
+/// sends the sub-agent's own rollout when the parent's rollout is nowhere to be found.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_subagent_stop_needs_no_parent_rollout() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.install(&s);
+    let work = env.root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let parent = "019f0000-8888-7000-8000-000000000088";
+    let child = "019f0000-9999-7000-8000-000000000099";
+    let long = format!(
+        "orphanquokka {}",
+        "the reviewer reads every hunk. ".repeat(8)
+    );
+    let child_path = env.write_rollout("2026/10/16", child, &rollout(child, &[long.as_str()]));
+    let mut input = codex_input(parent, json!(null), &work, "SubagentStop");
+    input["agent_id"] = json!("review_w1");
+    input["agent_transcript_path"] = json!(child_path);
+    env.codex_hook(&input);
+    env.wait_idle();
+    assert_eq!(
+        turns_of(&t.home, &format!("codex:session:{parent}:agent:{child}")),
+        1,
+        "{}",
+        env.log()
+    );
 }
 
 // ---- The token ----

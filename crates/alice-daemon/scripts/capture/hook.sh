@@ -44,7 +44,8 @@
 # Files, under ~/.config/alice (0700; every file 0600, this script 0700):
 #   token, url         read only, never written here (the team's setup document or setup.sh)
 #   capture.conf       briefing=on|off
-#   state/<agent>-<session>[-<agent_id>].offset   (<agent> is claude-code or codex)
+#   state/<agent>-<session>[-<agent_id>].offset   (<agent> is claude-code or codex; a Codex
+#                      sub-agent's id is its rollout's own id, not the hook's agent_id)
 #                      "<offset> <path>", then session, subagent, cwd, seen (when the transcript
 #                      was last there), and hold/closed/stopped lines; its mtime is set back to
 #                      1971 while work is left, so a sweep sees the transcript as newer
@@ -357,12 +358,24 @@ hook_main() {
       fi
       ;;
   esac
-  # A subagent's own transcript is its own source; anything less is the main session's. Codex
-  # names a sub-agent's own rollout the same way (its session_id is the parent's).
-  if [ "$h_event" != subagent-stop ] || ! valid_id "$h_sub"; then
-    h_sub=
-  fi
+  # A subagent's own transcript is its own source; anything less is the main session's.
+  if [ "$h_event" != subagent-stop ]; then h_sub=; fi
   case $h_subpath in /*.zst) h_sub= ;; /*) ;; *) h_sub= ;; esac
+  # Codex names a sub-agent's own rollout the same way (its session_id is the parent's). The
+  # sub-agent is known by the rollout's own id, the thread id its name ends with, never by
+  # agent_id, which a session may give a second sub-agent once the first is done: a new rollout
+  # is a new state, read from its start (the worker checks the rollout's first line names it).
+  if [ -n "$h_sub" ] && [ "$h_agent" = codex ]; then
+    h_sub=${h_subpath##*/}
+    case $h_sub in
+      rollout-????-??-??T??-??-??-*.jsonl)
+        h_sub=${h_sub#rollout-????-??-??T??-??-??-}
+        h_sub=${h_sub%.jsonl}
+        ;;
+      *) h_sub= ;;
+    esac
+  fi
+  valid_id "$h_sub" || h_sub=
   if [ -f "$0" ]; then
     if [ -n "$h_sub" ]; then
       nohup sh "$0" run "$h_agent" "$h_event" "$h_session" "$h_path" "$h_cwd" "$h_sub" "$h_subpath" \
@@ -880,11 +893,15 @@ discover() {
   [ -d "$dv_dir" ] || return 0
   for dv_f in "$dv_dir"/agent-*.jsonl; do
     [ "$dv_left" -gt 0 ] || return 0
+    paused && return 0
     [ -f "$dv_f" ] || continue
     dv_id=${dv_f##*/agent-}
     dv_id=${dv_id%.jsonl}
     valid_id "$dv_id" || continue
     [ ! -f "$STATE/claude-code-$1-$dv_id.offset" ] || continue
+    # Unchanged for 5 minutes: one still running is left to its own SubagentStop, so its
+    # trailing turn is not closed mid-way (a later event finds a killed one).
+    [ -n "$(find "$dv_f" -prune -mmin +5 2>/dev/null)" ] || continue
     capture_one "claude-code-$1-$dv_id" sweep "$1" "$dv_id" "$dv_f" "$3" 0
     if [ -n "$co_sent" ]; then dv_left=$((dv_left - 1)); fi
   done
@@ -971,7 +988,14 @@ run_main() {
   self_update
   # The transcript may lag the event that names it.
   if [ "$r_event" != session-start ]; then sleep 2; fi
-  if [ "$r_agent" = codex ] && [ -z "$r_path" ]; then
+  # A Codex sub-agent's rollout must hold its own id (the one its name gives) on its first line.
+  if [ "$r_agent" = codex ] && [ -n "$r_sub" ] &&
+    ! head -n 1 "$r_subpath" 2>/dev/null | grep -q "\"id\"[[:space:]]*:[[:space:]]*\"$r_sub\""; then
+    log "session $r_session: the sub-agent's rollout does not name its own id on its first line; the parent's rollout is sent instead"
+    r_sub=
+  fi
+  # The parent's rollout is looked for only when it is the one sent.
+  if [ "$r_agent" = codex ] && [ -z "$r_path" ] && [ -z "$r_sub" ]; then
     r_path=$(find_rollout "$r_session")
     if [ -z "$r_path" ]; then
       log "session $r_session: no rollout file for this session in the newest seven day folders under \$CODEX_HOME/sessions; the next event looks again"
