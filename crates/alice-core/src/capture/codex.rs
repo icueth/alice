@@ -13,8 +13,8 @@
 //! - `event_msg`, `turn_context`, `world_state`, `token_usage_record`, `session_meta` and
 //!   `inter_agent_communication_metadata` are known and carry no conversation text that
 //!   `response_item` does not also hold;
-//! - a line of another `type` is bookkeeping when neither it nor its payload has a key
-//!   conversation is kept under ([`LineResult::Bookkeeping`]), else `Unknown`.
+//! - a line of another `type` is bookkeeping when no key conversation is kept under appears in
+//!   it at any depth ([`LineResult::Bookkeeping`]), else `Unknown`.
 //!
 //! A rollout line has no uuid, so a turn is keyed by the hash of its time and first text
 //! ([`super::turn_key`] with `None`). Codex's shell is the custom tool `exec`, and `shell`,
@@ -81,16 +81,14 @@ pub(crate) fn parse_line(line: &[u8]) -> LineResult {
     }
 }
 
-/// A line of a `type` the parser does not know: bookkeeping when neither it nor its payload has a
-/// key conversation is kept under, else `Unknown`. A payload that is not an object may be the
-/// text itself, so it counts as one.
+/// A line of a `type` the parser does not know: bookkeeping when no key conversation, a tool call
+/// or its output is kept under appears in it at any depth, payload included, else `Unknown`. A
+/// payload that is not an object may be the text itself, so it counts as one.
 fn unknown_line(obj: &Map<String, Value>) -> LineResult {
-    let payload_talks = match obj.get("payload") {
-        None | Some(Value::Null) => false,
-        Some(Value::Object(payload)) => has_conversation_key(payload),
-        Some(_) => true,
-    };
-    if payload_talks || has_conversation_key(obj) {
+    let opaque = obj
+        .get("payload")
+        .is_some_and(|p| !p.is_object() && !p.is_null());
+    if opaque || has_conversation_key(obj) {
         LineResult::Unknown
     } else {
         LineResult::Bookkeeping
@@ -688,9 +686,9 @@ mod tests {
         assert!(r.blocks.is_empty());
     }
 
-    /// A line `type` the parser does not know is bookkeeping when neither the line nor its
-    /// payload has a key conversation is kept under (`message`, `content`, `text`, `summary`).
-    /// With one, or with a payload that is not an object (it may be the text), it stays
+    /// A line `type` the parser does not know is bookkeeping when no key conversation, a tool call
+    /// or its output is kept under appears in it at any depth, payload included. With one
+    /// anywhere, or with a payload that is not an object (it may be the text), it stays
     /// `Unknown`; so does an unknown `payload.type` of a known line type.
     #[test]
     fn an_unknown_line_type_without_conversation_keys_is_bookkeeping() {
@@ -709,12 +707,51 @@ mod tests {
             parse(json!({"timestamp": "t", "type": "future_ledger"})),
             LineResult::Bookkeeping
         );
-        for key in ["message", "content", "text", "summary"] {
+        for key in [
+            "message",
+            "content",
+            "text",
+            "summary",
+            "arguments",
+            "input",
+            "output",
+            "prompt",
+            "command",
+            "result",
+            "error",
+            "thinking",
+            "reasoning",
+        ] {
             assert_eq!(line(json!({key: "words"})), LineResult::Unknown, "{key}");
+            assert_eq!(
+                line(json!({"items": [{"deeper": {key: "words"}}]})),
+                LineResult::Unknown,
+                "nested {key}"
+            );
             let mut top = json!({"timestamp": "t", "type": "future_ledger", "payload": {}});
             top[key] = json!("words");
             assert_eq!(parse(top), LineResult::Unknown, "top-level {key}");
         }
+        // Tool calls and their outputs moved to a new line type (fix round 1, I3).
+        assert_eq!(
+            parse(
+                json!({"timestamp": "t", "type": "turn_item", "payload": {"type": "function_call",
+                "name": "exec", "arguments": "{\"cmd\":\"ls\"}", "call_id": "c"}})
+            ),
+            LineResult::Unknown
+        );
+        assert_eq!(
+            parse(json!({"timestamp": "t", "type": "turn_item", "payload": {
+                "type": "function_call_output", "call_id": "c", "output": "done"}})),
+            LineResult::Unknown
+        );
+        assert_eq!(
+            line(
+                json!({"thread_id": "x", "turns": [{"usage": {"input_tokens": 1}}],
+                        "outputTokens": 2, "note": "output"})
+            ),
+            LineResult::Bookkeeping
+        );
         assert_eq!(line(json!("words")), LineResult::Unknown);
         assert_eq!(line(json!(["words"])), LineResult::Unknown);
         assert_eq!(

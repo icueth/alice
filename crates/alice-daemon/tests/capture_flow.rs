@@ -360,8 +360,8 @@ async fn an_upload_captures_complete_turns_and_returns_the_cursor() {
 }
 
 /// Follow-up (capture gaps): the health counts bookkeeping lines (a type the reader does not know,
-/// with no `message`, `content`, `text` or `summary` key) apart from unrecognised ones, which an
-/// unknown type with such a key still is. A known type of a newer build is neither.
+/// with no conversation key at any depth) apart from unrecognised ones, which an unknown type with
+/// such a key still is. A known type of a newer build is neither.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_health_counts_bookkeeping_lines_apart_from_unrecognised_ones() {
     let (_d, svc) = tenant();

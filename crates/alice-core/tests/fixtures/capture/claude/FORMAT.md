@@ -80,11 +80,11 @@ values) found eight more top-level types. None carries conversation, and none is
 | `agent-name` | `agentName`, `sessionId` | 5 |
 
 No unknown content-block type was found. Claude Code adds lines like these with most releases, so Alice's reader
-drops a line of a `type` it does not know as **bookkeeping** when the line has none of the keys conversation is
-kept under (`message`, `content`, `text`, `summary`). Bookkeeping lines are counted apart (`alice doctor` may name
-them as a detail, never as a problem). A line of an unknown `type` that has any of those keys is counted as
-unrecognised: the format may have changed, and `alice doctor` warns. A line without a string `type` is
-unrecognised too.
+drops a line of a `type` it does not know as **bookkeeping** only when none of the keys conversation, tool calls and
+their results are kept under appears in it at any depth, in nested objects and inside arrays too: `message`, `content`, `text`, `summary`, `arguments`, `input`, `output`, `prompt`, `command`, `result`, `error`, `thinking`, `reasoning`.
+Bookkeeping lines are counted apart (`alice doctor` may name them as a detail, never as a problem). A line of an
+unknown `type` that has any of those keys anywhere is counted as unrecognised: the format may have changed, and
+`alice doctor` warns. A line without a string `type` is unrecognised too.
 
 ## Conversation chain
 
@@ -618,8 +618,8 @@ These effects are **artifacts of the windows, not features of the format**:
 ## Parser checklist
 
 1. Read line by line; skip a line that is not valid JSON; dispatch on `type` first and ignore unknown `type`
-   (never on `message.role` alone). Tell an unknown `type` with no `message`, `content`, `text` or `summary`
-   key (bookkeeping) from one with such a key (a possible format change).
+   (never on `message.role` alone). Tell an unknown `type` with none of the conversation keys above at any
+   depth (bookkeeping) from one with such a key anywhere (a possible format change).
 2. Conversation lines: `user`, `assistant`. Drop `isMeta: true`, `isCompactSummary: true`, `isSidechain: true` (main
    files should have none) and `tool_result` lines when you want typed prompts only.
 3. Group `assistant` lines by `message.id`; take usage once.

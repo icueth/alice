@@ -78,7 +78,7 @@ so the format is fixed:
 | Other tools | The input as compact JSON (at most 300 characters) and the output, trimmed |
 | Long runs of base64-like text, or text that is mostly unprintable | `[binary removed]` |
 | Progress lines, file snapshots, titles, system lines, hook output | Dropped |
-| Bookkeeping lines of a type Alice does not know yet, holding none of `message`, `content`, `text`, `summary` | Dropped and counted apart (agents add such lines with new releases). A line of an unknown type that holds one of those keys is counted as unrecognised, and `alice doctor` warns |
+| Bookkeeping lines of a type Alice does not know yet, holding none of `message`, `content`, `text`, `summary`, `arguments`, `input`, `output`, `prompt`, `command`, `result`, `error`, `thinking`, `reasoning` at any depth | Dropped and counted apart (agents add such lines with new releases). A line of an unknown type that holds one of those keys anywhere is counted as unrecognised, and `alice doctor` warns |
 | A transcript line over 4 MiB | Skipped, leaving `[record skipped: too large]` in its turn |
 
 "Trimmed" means the head and the tail of the output, with a marker such as `[… 12,345 characters trimmed …]` between them.

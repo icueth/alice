@@ -65,9 +65,11 @@ names and counts, no values) found two shapes this table lacks, 40 lines each, i
 fixture first.
 
 As for Claude Code, Alice drops a line of a top-level `type` it does not know as **bookkeeping**, counted apart
-and never as drift, when neither the line nor its `payload` has a `message`, `content`, `text` or `summary` key.
-With such a key, or with a `payload` that is not an object, the line counts as unrecognised. An unknown
-`payload.type` of a known line type (`response_item`, as `agent_message` is) always counts as unrecognised.
+and never as drift, only when none of these keys appears in it at any depth, its `payload` and the arrays in it
+included: `message`, `content`, `text`, `summary`, `arguments`, `input`, `output`, `prompt`, `command`, `result`, `error`, `thinking`, `reasoning` (the keys Codex keeps tool calls and outputs under, `arguments`, `input` and `output`,
+among them). With such a key anywhere, or with a `payload` that is not an object, the line counts as unrecognised.
+An unknown `payload.type` of a known line type (`response_item`, as `agent_message` is) always counts as
+unrecognised.
 
 ### `response_item.message` content blocks
 
@@ -144,7 +146,7 @@ payload `replacement_history` entries other than the ones kept.
 ## Parser checklist
 
 1. Check the envelope (`timestamp`, `type`, `ordinal`, `payload`); skip lines that do not parse. Tell an unknown
-   line `type` with no conversation key in it or its payload (bookkeeping) from one with such a key.
+   line `type` with no conversation key at any depth (bookkeeping) from one with such a key anywhere.
 2. Typed prompts: `event_msg` / `item_completed` / `UserMessage` (or `response_item.message` with `role: "user"` and
    `content_item_kinds` containing `user.text`). Assistant text: `AgentMessage` or `response_item.message` with
    `role: "assistant"`.

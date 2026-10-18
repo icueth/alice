@@ -181,9 +181,10 @@ pub struct ReadStats {
     /// conversation is kept under, or a conversation line with no usable content): format drift.
     /// Known line types that carry no conversation are not counted, nor is `bookkeeping`.
     pub unknown: u64,
-    /// Lines of an unknown `type` with none of the keys conversation is kept under (`message`,
-    /// `content`, `text`, `summary`; for Codex, in the line or its payload): bookkeeping a newer
-    /// agent build added. Dropped, and never counted in `unknown`.
+    /// Lines of an unknown `type` with none of the keys conversation, tool calls and their results
+    /// are kept under (`message`, `content`, `text`, `summary`, `arguments`, `input`, `output`,
+    /// `prompt`, `command`, `result`, `error`, `thinking`, `reasoning`) at any depth: bookkeeping a
+    /// newer agent build added. Dropped, and never counted in `unknown`.
     pub bookkeeping: u64,
     /// Lines that are not UTF-8, not JSON, or not a JSON object.
     pub invalid: u64,
@@ -869,16 +870,37 @@ mod tests {
         assert!(out.turns.is_empty() && out.tail.is_empty());
         assert_eq!(out.consumed, 0);
         assert!(out.stats.lines > 0);
-        // Every Claude line is of a type the Codex reader does not know: the ones that carry
-        // conversation are unknown to it (drift shows), the rest bookkeeping.
+        // Every Claude line is of a type the Codex reader does not know: the ones with a key of
+        // the ruling at any depth (fix round 1, I3) are unknown to it (drift shows), the rest
+        // bookkeeping.
+        fn talks(v: &serde_json::Value) -> bool {
+            const KEYS: [&str; 13] = [
+                "message",
+                "content",
+                "text",
+                "summary",
+                "arguments",
+                "input",
+                "output",
+                "prompt",
+                "command",
+                "result",
+                "error",
+                "thinking",
+                "reasoning",
+            ];
+            match v {
+                serde_json::Value::Object(o) => o
+                    .iter()
+                    .any(|(k, v)| KEYS.contains(&k.as_str()) || talks(v)),
+                serde_json::Value::Array(items) => items.iter().any(talks),
+                _ => false,
+            }
+        }
         let talks = TURNS
             .split(|&b| b == b'\n')
             .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
-            .filter(|v| {
-                ["message", "content", "text", "summary"]
-                    .iter()
-                    .any(|k| v.get(k).is_some())
-            })
+            .filter(talks)
             .count() as u64;
         assert!(talks > 0);
         assert_eq!(

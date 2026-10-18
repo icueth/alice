@@ -3,7 +3,7 @@
 //! The format is undocumented and changes between versions, so a line is read as a
 //! `serde_json::Value`, never into derived structs: every field except `type` is optional, and a
 //! shape the parser does not know degrades to [`LineResult::Unknown`] instead of failing. A line
-//! of a `type` it does not know that has no key conversation is kept under is
+//! of a `type` it does not know that has no key conversation is kept under, at any depth, is
 //! [`LineResult::Bookkeeping`]: Claude Code adds such lines with most releases.
 
 use serde_json::{Map, Value};
@@ -19,8 +19,8 @@ pub(crate) enum LineResult {
     Drift(Record),
     /// A JSON object whose shape the parser does not recognise (counted, never fatal).
     Unknown,
-    /// A line of a `type` the parser does not know that has none of [`CONVERSATION_KEYS`]: the
-    /// bookkeeping a newer agent build added. Dropped, and counted apart from `Unknown`, so it
+    /// A line of a `type` the parser does not know that has none of [`CONVERSATION_KEYS`] at any
+    /// depth: the bookkeeping a newer agent build added. Dropped, and counted apart from `Unknown`, so it
     /// is never taken for format drift.
     Bookkeeping,
     /// Not UTF-8, not JSON, or a JSON value that is not an object.
@@ -66,13 +66,39 @@ const DROPPED_TYPES: &[&str] = &[
     "agent-name",
 ];
 
-/// The keys conversation is kept under. A line of a `type` the parser does not know is
-/// bookkeeping when it has none of them ([`LineResult::Bookkeeping`]), else format drift.
-const CONVERSATION_KEYS: &[&str] = &["message", "content", "text", "summary"];
+/// The keys conversation, tool calls and their results are kept under, in either agent's
+/// transcripts (fix round 1, I3, ruling). A line of a `type` the parser does not know is
+/// bookkeeping only when none of them appears at any depth ([`LineResult::Bookkeeping`]), else
+/// format drift.
+const CONVERSATION_KEYS: &[&str] = &[
+    "message",
+    "content",
+    "text",
+    "summary",
+    "arguments",
+    "input",
+    "output",
+    "prompt",
+    "command",
+    "result",
+    "error",
+    "thinking",
+    "reasoning",
+];
 
-/// Whether `obj` has any of [`CONVERSATION_KEYS`] (whatever its value).
+/// Whether `obj`, or any object nested in it at any depth (inside arrays too), has one of
+/// [`CONVERSATION_KEYS`], whatever its value. The depth is bounded by `serde_json`'s parse limit.
 pub(crate) fn has_conversation_key(obj: &Map<String, Value>) -> bool {
-    CONVERSATION_KEYS.iter().any(|k| obj.contains_key(*k))
+    obj.iter()
+        .any(|(k, v)| CONVERSATION_KEYS.contains(&k.as_str()) || value_has_conversation_key(v))
+}
+
+fn value_has_conversation_key(v: &Value) -> bool {
+    match v {
+        Value::Object(obj) => has_conversation_key(obj),
+        Value::Array(items) => items.iter().any(value_has_conversation_key),
+        _ => false,
+    }
 }
 
 /// Parses one line (without its `\n`).
@@ -472,8 +498,8 @@ mod tests {
     }
 
     /// A type the parser does not know is bookkeeping when it has none of the keys conversation is
-    /// kept under (`message`, `content`, `text`, `summary`); with any of them it stays `Unknown`,
-    /// format drift. A line without a string `type` is no type at all: `Unknown`.
+    /// kept under; with any of them it stays `Unknown`, format drift. A line without a string
+    /// `type` is no type at all: `Unknown`.
     #[test]
     fn an_unknown_type_without_conversation_keys_is_bookkeeping() {
         assert_eq!(
@@ -487,7 +513,7 @@ mod tests {
             parse(json!({"type": "brand-new-type"})),
             LineResult::Bookkeeping
         );
-        for key in ["message", "content", "text", "summary"] {
+        for key in RULED_KEYS {
             let mut v = json!({"type": "brand-new-type", "sessionId": "s"});
             v[key] = json!(null);
             assert_eq!(parse(v), LineResult::Unknown, "{key}");
@@ -501,6 +527,55 @@ mod tests {
         assert_eq!(
             parse(json!({"type": "user", "uuid": "u"})),
             LineResult::Unknown
+        );
+    }
+
+    /// The keys of the ruling (fix round 1, I3), written out so that a key missing from
+    /// `CONVERSATION_KEYS` fails the tests.
+    const RULED_KEYS: [&str; 13] = [
+        "message",
+        "content",
+        "text",
+        "summary",
+        "arguments",
+        "input",
+        "output",
+        "prompt",
+        "command",
+        "result",
+        "error",
+        "thinking",
+        "reasoning",
+    ];
+
+    /// Fix round 1, I3 (ruling): a conversation key at any depth, in an object or inside an
+    /// array, keeps an unknown type `Unknown`; only a line with none of them anywhere is
+    /// bookkeeping, however deep it nests.
+    #[test]
+    fn a_conversation_key_at_any_depth_keeps_an_unknown_type_unknown() {
+        assert_eq!(
+            parse(
+                json!({"type": "agent-progress", "data": {"message": {"role": "assistant",
+                "content": [{"type": "text", "text": "Working."}]}}})
+            ),
+            LineResult::Unknown
+        );
+        for key in RULED_KEYS {
+            let mut nested = json!({"leaf": 1});
+            nested[key] = json!("words");
+            for v in [
+                json!({"type": "brand-new-type", "data": {"deeper": nested.clone()}}),
+                json!({"type": "brand-new-type", "data": {"items": [1, {"deeper": [nested.clone()]}]}}),
+            ] {
+                assert_eq!(parse(v.clone()), LineResult::Unknown, "{key} in {v}");
+            }
+        }
+        // Keys that only look alike, values that hold a key's name, and deep nesting: bookkeeping.
+        assert_eq!(
+            parse(json!({"type": "brand-new-ledger", "sessionId": "s",
+                "data": {"a": {"b": [{"c": [1, 2, {"d": "message"}]}]}},
+                "messageCount": 3, "textLength": 9, "contentHash": "h", "inputTokens": 5})),
+            LineResult::Bookkeeping
         );
     }
 
