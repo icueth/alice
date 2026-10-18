@@ -3006,8 +3006,10 @@ async fn the_briefing_gives_up_within_two_seconds() {
         "tenant hook: session-start with a stalled server took {:.0} ms",
         r.elapsed.as_secs_f64() * 1e3
     );
+    // The 2 s limit is curl's; the shell, credentials and worker start add up to about a second
+    // on a loaded CI macOS runner (2.72 s seen), so the bound only proves the hook gave up.
     assert!(
-        r.elapsed < Duration::from_millis(2500),
+        r.elapsed < Duration::from_millis(3500),
         "the hook took {:?}",
         r.elapsed
     );
