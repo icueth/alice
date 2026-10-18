@@ -2998,8 +2998,8 @@ async fn the_trailing_turn_is_closed_by_the_quiet_sweep() {
 }
 
 /// Ruling 1: a turn whose tool call has no answer stays open through `Stop` and the quiet
-/// sweep; after `capture_stale` (24 hours) without an event the sweep closes it whatever it
-/// waits for and ends the source.
+/// sweep; after a day without an event the sweep closes it whatever it waits for and ends the
+/// source (it does so from `capture_abandoned`, 6 hours, on: see the tests after this one).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_session_is_ended_by_the_sweep() {
     let (d, svc) = local();
@@ -3037,6 +3037,209 @@ async fn a_stale_session_is_ended_by_the_sweep() {
     assert_eq!(state_of(&svc, &uri("st")).unwrap().byte_offset, t.len());
     let st = svc.capture_status().await.unwrap();
     assert!(st.sessions.iter().any(|s| s.uri == uri("st") && s.ended));
+}
+
+/// Follow-up (capture gaps), the tenant script's 6-hour rule locally: a transcript holding a turn
+/// no pass could close (its tool call has no result) that has not changed for 6 hours gets the
+/// final pass at once, as a stale one does, without waiting out the 24 hours. Younger, it stays
+/// open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_turn_is_closed_after_six_hours_unchanged() {
+    let (d, svc) = local();
+    let path = d.path().join("ab.jsonl");
+    let mut t = Transcript::default();
+    t.turn("ab", 1, "finished before the kill");
+    let second = t.len();
+    t.prompt("ab-p2", "Watch the build.")
+        .tool_use("ab-a2", "toolu_ab", "sleep abandoned");
+    std::fs::write(&path, &t.bytes).unwrap();
+    svc.capture_notify(notify("ab", &path, "stop"))
+        .await
+        .unwrap();
+    until("turn 1", || {
+        state_of(&svc, &uri("ab")).is_some_and(|s| s.byte_offset == second)
+    })
+    .await;
+
+    age(&path, Duration::from_secs(5 * 3600 + 50 * 60));
+    let before = passes(&svc);
+    until("a sweep passed the aged transcript", || {
+        passes(&svc) > before
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(chunks_holding(&svc, "sleep abandoned"), 0);
+    assert!(!state_of(&svc, &uri("ab")).unwrap().ended);
+
+    age(&path, Duration::from_secs(6 * 3600 + 120));
+    until("the 6-hour close ends the source", || {
+        state_of(&svc, &uri("ab")).unwrap().ended
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "[tool Bash] sleep abandoned"), 1);
+    assert_eq!(state_of(&svc, &uri("ab")).unwrap().byte_offset, t.len());
+}
+
+/// Follow-up (capture gaps): a new session's transcript is written with its first message, after
+/// its `SessionStart`, so a session killed during its first turn (no `Stop` ever comes) had no
+/// source, and the sweep never saw it. The start now waits for the file (each sweep looks), the
+/// file's first pass registers the source, and with the clock running (`capture_abandoned` short,
+/// the file's time never moved) a later sweep asks for the final pass of the held turn itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_turn_left_mid_way_is_registered_and_closed_once_abandoned() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            capture_abandoned: Duration::from_millis(1500),
+            ..local_options()
+        },
+    );
+    let path = d.path().join("al.jsonl");
+    svc.capture_notify(notify("al", &path, "session-start"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(state_of(&svc, &uri("al")).is_none());
+    let mut t = Transcript::default();
+    t.prompt("al-p1", "Watch the build.")
+        .tool_use("al-a1", "toolu_al", "sleep alone");
+    std::fs::write(&path, &t.bytes).unwrap();
+    until("the start's pass registers the source", || {
+        state_of(&svc, &uri("al")).is_some()
+    })
+    .await;
+    until("the abandoned close ends the source", || {
+        state_of(&svc, &uri("al")).unwrap().ended
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "[tool Bash] sleep alone"), 1);
+    assert_eq!(state_of(&svc, &uri("al")).unwrap().byte_offset, t.len());
+}
+
+/// A start waits for its transcript at most `capture_stale`: a session that never wrote one is
+/// forgotten, and a file that turns up later is left to the session's own events.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_waits_for_its_transcript_at_most_the_stale_age() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            capture_stale: Duration::from_millis(800),
+            ..local_options()
+        },
+    );
+    let path = d.path().join("nw.jsonl");
+    svc.capture_notify(notify("nw", &path, "session-start"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut t = Transcript::default();
+    t.turn("nw", 1, "too late for the start");
+    std::fs::write(&path, &t.bytes).unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(state_of(&svc, &uri("nw")).is_none());
+    assert_eq!(passes(&svc), 0);
+}
+
+/// Follow-up (capture gaps): an ended session that is resumed and left mid-turn (a crash, a
+/// kill, a closed app) has bytes past its cursor that no event brings, and the sweep looks at
+/// open sources only. Once that transcript has not changed for 6 hours, its final pass takes the
+/// trailing turn; once per hold, even when bytes stay past the cursor (a line cut short). A later
+/// resume goes on: the new lines are taken, the source is open again, nothing is stored twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ended_session_left_mid_turn_is_closed_after_six_hours() {
+    let (d, svc) = local();
+    let path = d.path().join("re.jsonl");
+    let mut t = Transcript::default();
+    t.turn("re", 1, "before the end");
+    std::fs::write(&path, &t.bytes).unwrap();
+    svc.capture_notify(notify("re", &path, "session-end"))
+        .await
+        .unwrap();
+    // A pass is counted a moment after its writes are visible: wait for both.
+    until("ended", || {
+        passes(&svc) > 0
+            && state_of(&svc, &uri("re")).is_some_and(|s| s.ended && s.byte_offset == t.len())
+    })
+    .await;
+    // An ended session with nothing past its cursor is never passed, however old.
+    age(&path, Duration::from_secs(7 * 3600));
+    let quiet = passes(&svc);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(passes(&svc), quiet);
+
+    // Resumed: a prompt and a tool call that never gets its result, and a line cut short.
+    t.prompt("re-p2", "Run the migration.")
+        .tool_use("re-a2", "toolu_re", "sleep resumedjob");
+    let held = t.len();
+    let mut bytes = t.bytes.clone();
+    bytes.extend_from_slice(br#"{"type":"mode","#);
+    std::fs::write(&path, &bytes).unwrap();
+    let before = passes(&svc);
+    svc.capture_notify(notify("re", &path, "session-start"))
+        .await
+        .unwrap();
+    until("the resume's pass", || passes(&svc) > before).await;
+    assert!(state_of(&svc, &uri("re")).unwrap().ended);
+
+    // Younger than 6 hours: left alone (the ended sources are looked at every tenth sweep).
+    age(&path, Duration::from_secs(5 * 3600));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(chunks_holding(&svc, "sleep resumedjob"), 0);
+
+    let before = passes(&svc);
+    age(&path, Duration::from_secs(6 * 3600 + 120));
+    // A pass is counted a moment after its writes are visible: wait for both.
+    until_within(
+        "the 6-hour close stores the trailing turn",
+        Duration::from_secs(30),
+        || passes(&svc) > before && chunks_holding(&svc, "[tool Bash] sleep resumedjob") == 1,
+    )
+    .await;
+    let row = state_of(&svc, &uri("re")).unwrap();
+    assert!(row.ended);
+    assert_eq!(
+        row.byte_offset, held,
+        "the line cut short stays past the cursor"
+    );
+    let after = passes(&svc);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        passes(&svc),
+        after,
+        "not passed again while the file stays as it is"
+    );
+
+    // Resumed again: the line is finished, the tool's result, a reply and a new turn follow.
+    bytes.extend_from_slice(b"\"mode\":\"default\",\"sessionId\":\"re\"}\n");
+    let mut more = Transcript {
+        clock: t.clock,
+        ..Default::default()
+    };
+    more.tool_result("re-r2", "toolu_re", "lateresultquokka")
+        .reply("re-a2b", "Migrated.")
+        .turn("re", 3, "afterresumequokka");
+    bytes.extend_from_slice(&more.bytes);
+    std::fs::write(&path, &bytes).unwrap();
+    svc.capture_notify(notify("re", &path, "stop"))
+        .await
+        .unwrap();
+    until("the resumed turns", || {
+        chunks_holding(&svc, "afterresumequokka") == 1
+    })
+    .await;
+    let row = state_of(&svc, &uri("re")).unwrap();
+    assert!(!row.ended, "new turns open the source again");
+    assert_eq!(row.byte_offset, bytes.len() as u64);
+    for marker in [
+        "before the end",
+        "sleep resumedjob",
+        "lateresultquokka",
+        "afterresumequokka",
+    ] {
+        assert_eq!(chunks_holding(&svc, marker), 1, "{marker}");
+    }
 }
 
 /// Stops `svc` (as a crash between two writes would leave it), runs `sql` on its database, and

@@ -59,6 +59,11 @@ const MIN_SUBAGENT_CHARS: usize = 200;
 const SKIPPED_KEYS_PER_SLICE: usize = 500;
 /// How many days of line counts (unrecognised, bookkeeping) are kept.
 const UNKNOWN_DAYS: i64 = 7;
+/// A transcript holding a turn no pass could close (its tool call has no result, say) that has
+/// not changed for this long was left mid-turn (a crash, a kill, a closed app): it gets the final
+/// pass a session end would bring. The tenant script's sweep keeps the same 6 hours
+/// (`ABANDONED_MIN` in `hook.sh`); locally it is [`LocalCaptureConfig::abandoned`].
+pub const ABANDONED: Duration = Duration::from_secs(6 * 3600);
 /// The largest byte offset a transcript can have: 2^53, exact in every JSON client and far
 /// beyond any transcript. A larger offset is refused before anything is read, so no offset
 /// arithmetic can overflow and no cursor is stored saturated (SQLite integers are signed).
@@ -1276,7 +1281,11 @@ pub use local::{
 ///   uuid and time when they sit near its end (Claude Code writes them there).
 /// - **The sweep**, every `sweep_every` and at start, passes the open sources whose transcript
 ///   changed since their last pass, or whose idle time asks for a stronger close: quiet for
-///   `quiet` closes the trailing turn, idle for `stale` makes a final pass and ends the source.
+///   `quiet` closes the trailing turn, idle for `stale` makes a final pass and ends the source,
+///   and so does idle for `abandoned` (6 hours) while the transcript holds bytes past the
+///   cursor. Every tenth sweep also looks at the ended sources: one whose transcript holds bytes
+///   past its cursor, unchanged for `abandoned`, is a session resumed after its end and left
+///   mid-turn, and gets the same final pass, once per hold.
 /// - **Codex** (ruling 6): a null transcript path is looked for under `$CODEX_HOME/sessions`.
 ///
 /// A server tenant runs no worker: it never opens a client's files (spec §5.6).
@@ -1291,6 +1300,7 @@ mod local {
     use alice_core::settings::DistillProvider;
     use alice_core::store::ReaderPool;
     use alice_core::store::capture as store;
+    use alice_core::store::capture::CaptureState;
     use alice_core::{AliceError, Result};
     use axum::body::Bytes;
     use parking_lot::Mutex;
@@ -1328,6 +1338,9 @@ mod local {
     const PASSES_PER_TURN: usize = 8;
     /// Date folders of `$CODEX_HOME/sessions` searched for a rollout (spec §4.2).
     const ROLLOUT_DAYS: usize = 7;
+    /// The ended sources are looked at every this many sweeps (and at the first): every 10
+    /// minutes with the default `sweep_every`. The 6-hour close needs no more.
+    const ENDED_EVERY: u64 = 10;
 
     /// How a pass treats the transcript's trailing turn (ruling 1). Ordered: a stronger close
     /// is never replaced by a weaker one.
@@ -1496,6 +1509,9 @@ mod local {
         pub quiet: Duration,
         /// A transcript idle this long gets a final pass, and its source ends.
         pub stale: Duration,
+        /// A transcript holding bytes past its source's cursor that is idle this long gets that
+        /// final pass sooner, ended source or not ([`super::ABANDONED`]).
+        pub abandoned: Duration,
         /// `$CODEX_HOME`: where a Codex session's rollout is looked for when its hook gave no
         /// path. `None`: never looked for.
         pub codex_home: Option<PathBuf>,
@@ -1544,6 +1560,12 @@ mod local {
         cfg: LocalCaptureConfig,
         /// The jobs waiting, one per source uri.
         pending: Mutex<HashMap<String, Job>>,
+        /// Session starts whose transcript did not exist yet (it is written with the first
+        /// message, after `SessionStart`), by source uri, with when they came. Each sweep queues
+        /// one again once its file exists, so a session killed during its first turn (no `Stop`
+        /// ever comes) still gets a source the sweep closes. Dropped once the source exists, or
+        /// `stale` after the start.
+        starting: Mutex<HashMap<String, (Job, Instant)>>,
         /// bounded(1): notifications that arrive together wake the thread once.
         wake_tx: crossbeam_channel::Sender<()>,
         wake_rx: crossbeam_channel::Receiver<()>,
@@ -1572,6 +1594,7 @@ mod local {
                 resolver,
                 cfg,
                 pending: Mutex::new(HashMap::new()),
+                starting: Mutex::new(HashMap::new()),
                 wake_tx,
                 wake_rx,
                 stop: AtomicBool::new(false),
@@ -1648,12 +1671,20 @@ mod local {
         fn run(&self) {
             crate::maintenance::lower_priority();
             let mut seen: HashMap<String, Seen> = HashMap::new();
+            let mut closed: HashMap<String, FileSeen> = HashMap::new();
+            let mut sweeps: u64 = 0;
             let mut next_sweep = Instant::now();
             while !self.stopping() {
                 if Instant::now() >= next_sweep {
                     if let Err(e) = self.sweep(&mut seen) {
                         tracing::warn!(error = %e, "the capture sweep failed; it runs again later");
                     }
+                    if sweeps.is_multiple_of(ENDED_EVERY)
+                        && let Err(e) = self.close_abandoned(&mut closed)
+                    {
+                        tracing::warn!(error = %e, "the capture sweep of ended sessions failed; it runs again later");
+                    }
+                    sweeps += 1;
                     next_sweep = Instant::now() + self.cfg.sweep_every;
                 }
                 while Instant::now() < next_sweep {
@@ -1703,12 +1734,13 @@ mod local {
             let _ = self.wake_tx.try_send(());
         }
 
-        /// `quiet` and `stale` applied to a transcript last changed at `mtime`.
-        fn close_by_age(&self, mtime: Option<SystemTime>, now: SystemTime) -> Close {
+        /// `quiet`, `abandoned` and `stale` applied to a transcript last changed at `mtime`.
+        /// `held`: it holds bytes past the source's cursor (a turn no pass could close yet).
+        fn close_by_age(&self, mtime: Option<SystemTime>, now: SystemTime, held: bool) -> Close {
             let idle = mtime
                 .and_then(|m| now.duration_since(m).ok())
                 .unwrap_or_default();
-            if idle >= self.cfg.stale {
+            if idle >= self.cfg.stale || (held && idle >= self.cfg.abandoned) {
                 Close::Force
             } else if idle >= self.cfg.quiet {
                 Close::Trailing
@@ -1718,15 +1750,16 @@ mod local {
         }
 
         /// Queues a pass of each open source whose transcript changed since its last pass, or
-        /// whose idle time asks for a stronger close (a stale one always: its final pass ends
-        /// it). A source it cannot read has no final pass: one with no transcript path (an
-        /// upload on a local daemon), or whose file is gone or is no longer a regular file, is
-        /// ended once nothing was captured for `stale` (spec §9.4). Locally the sweep owns the
-        /// stale end; the distill worker's runs on server tenants only.
+        /// whose idle time asks for a stronger close (a stale or abandoned one always: its final
+        /// pass ends it). A source it cannot read has no final pass: one with no transcript path
+        /// (an upload on a local daemon), or whose file is gone or is no longer a regular file,
+        /// is ended once nothing was captured for `stale` (spec §9.4). Locally the sweep owns
+        /// the stale end; the distill worker's runs on server tenants only.
         fn sweep(&self, seen: &mut HashMap<String, Seen>) -> Result<()> {
             let open = self.readers.with(store::open_sources)?;
             let uris: HashSet<&str> = open.iter().map(|s| s.uri.as_str()).collect();
             seen.retain(|uri, _| uris.contains(uri.as_str()));
+            self.start_when_written(&uris);
             let now = SystemTime::now();
             let mut unreadable = Vec::new();
             for s in &open {
@@ -1758,28 +1791,93 @@ mod local {
                     Err(_) => continue,
                 };
                 let (len, mtime) = (meta.len(), meta.modified().ok());
-                let close = self.close_by_age(mtime, now);
+                let close = self.close_by_age(mtime, now, len > s.byte_offset);
                 let last = seen.get(&s.uri);
                 let changed = last.is_none_or(|l| l.len != len || l.mtime != mtime);
                 let wanted = close == Close::Force
                     || (len != s.byte_offset && (changed || last.is_some_and(|l| l.close < close)));
                 if wanted {
-                    self.notify(Job {
-                        agent,
-                        session: s.session_id.clone(),
-                        subagent,
-                        path: Some(PathBuf::from(path)),
-                        cwd: None,
-                        event: "sweep".into(),
-                        close: Close::Open,
-                        end: false,
-                        by_age: true,
-                        not_before: Instant::now(),
-                    });
+                    self.notify(sweep_job(agent, s, subagent, path));
                 }
             }
             if !unreadable.is_empty() {
                 self.end_unreadable(&unreadable, open.len(), seen)?;
+            }
+            Ok(())
+        }
+
+        /// Queues each waiting session start (`starting`) whose transcript exists now; forgets
+        /// those whose source is open (`open`: another pass registered it) or that waited
+        /// `stale`.
+        fn start_when_written(&self, open: &HashSet<&str>) {
+            let mut written = Vec::new();
+            self.starting.lock().retain(|uri, (job, since)| {
+                if open.contains(uri.as_str()) || since.elapsed() >= self.cfg.stale {
+                    return false;
+                }
+                if job.path.as_deref().is_some_and(Path::is_file) {
+                    written.push(job.clone());
+                    return false;
+                }
+                true
+            });
+            for job in written {
+                self.notify(Job {
+                    not_before: Instant::now(),
+                    ..job
+                });
+            }
+        }
+
+        /// Queues the final pass of each ended source whose transcript holds bytes past its
+        /// cursor and has not changed for `abandoned` (6 hours): a session resumed after its end
+        /// and left mid-turn (a crash, a kill, a closed app). No event will bring its last turn,
+        /// and the sweep looks at open sources only. The pass closes the trailing turn whatever
+        /// it waits for, as a session end does; the source stays ended. Once per hold: `closed`
+        /// keeps the transcript's size and time when its pass was queued, and the source is not
+        /// queued again while they stay (a line cut short stays past the cursor). It is kept in
+        /// memory, so a daemon start may pass such a source once more, which stores nothing new.
+        fn close_abandoned(&self, closed: &mut HashMap<String, FileSeen>) -> Result<()> {
+            let ended = self.readers.with(store::ended_sources)?;
+            let uris: HashSet<&str> = ended.iter().map(|s| s.uri.as_str()).collect();
+            closed.retain(|uri, _| uris.contains(uri.as_str()));
+            let now = SystemTime::now();
+            for s in &ended {
+                if self.stopping() {
+                    break;
+                }
+                let Some(agent) = AgentKind::parse(&s.agent) else {
+                    continue;
+                };
+                let subagent = s.uri.split_once(":agent:").map(|(_, a)| a.to_owned());
+                if agent.source_uri(&s.session_id, subagent.as_deref()) != s.uri
+                    || self.pending.lock().contains_key(&s.uri)
+                {
+                    continue;
+                }
+                let Some(path) = s.transcript_path.as_deref() else {
+                    continue;
+                };
+                let Ok(meta) = std::fs::metadata(path) else {
+                    continue;
+                };
+                let file = FileSeen {
+                    len: meta.len(),
+                    mtime: meta.modified().ok(),
+                };
+                if !meta.is_file()
+                    || file.len <= s.byte_offset
+                    || self.close_by_age(file.mtime, now, true) != Close::Force
+                    || closed.get(&s.uri) == Some(&file)
+                {
+                    continue;
+                }
+                closed.insert(s.uri.clone(), file);
+                tracing::info!(
+                    uri = s.uri,
+                    "an ended session's transcript holds a turn no event brought, unchanged for 6 hours; its last turn is taken"
+                );
+                self.notify(sweep_job(agent, s, subagent, path));
             }
             Ok(())
         }
@@ -1924,9 +2022,16 @@ mod local {
                 let (mut file, meta) = match open_transcript(path) {
                     Ok(f) => f,
                     // A new session's transcript is written with its first message, after
-                    // SessionStart: the source is registered by the first pass that finds it.
+                    // SessionStart: the source is registered by the first pass that finds it,
+                    // and the start waits for it (`starting`).
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         tracing::debug!(uri, "the transcript does not exist yet");
+                        if job.event == "session-start" {
+                            self.starting
+                                .lock()
+                                .entry(uri.to_owned())
+                                .or_insert_with(|| (job.clone(), Instant::now()));
+                        }
                         return Ok(Outcome::Retry);
                     }
                     Err(e) => {
@@ -1965,7 +2070,8 @@ mod local {
                     skip_to = None;
                 }
                 let close = if job.by_age {
-                    job.close.max(self.close_by_age(mtime, SystemTime::now()))
+                    job.close
+                        .max(self.close_by_age(mtime, SystemTime::now(), len > cursor))
                 } else {
                     job.close
                 };
@@ -2063,6 +2169,30 @@ mod local {
                 at += n as u64;
             }
             Ok(None)
+        }
+    }
+
+    /// A transcript's size and modification time.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FileSeen {
+        len: u64,
+        mtime: Option<SystemTime>,
+    }
+
+    /// A sweep's pass of `s`, whose transcript is `path`: its close decided by the transcript's
+    /// idle time when it runs.
+    fn sweep_job(agent: AgentKind, s: &CaptureState, subagent: Option<String>, path: &str) -> Job {
+        Job {
+            agent,
+            session: s.session_id.clone(),
+            subagent,
+            path: Some(PathBuf::from(path)),
+            cwd: None,
+            event: "sweep".into(),
+            close: Close::Open,
+            end: false,
+            by_age: true,
+            not_before: Instant::now(),
         }
     }
 

@@ -171,6 +171,19 @@ pub fn open_sources(conn: &Connection) -> Result<Vec<CaptureState>> {
     )
 }
 
+/// Ended sources whose transcript is on this machine (a local daemon's; a tenant keeps no
+/// path), oldest first.
+pub fn ended_sources(conn: &Connection) -> Result<Vec<CaptureState>> {
+    many(
+        conn,
+        &format!(
+            "{SELECT_STATE} WHERE c.ended = 1 AND c.transcript_path IS NOT NULL
+             ORDER BY c.created_at, c.source_id"
+        ),
+        [],
+    )
+}
+
 /// Up to `limit` sources waiting to be distilled (`due`) whose next try has come at `now`
 /// (none set: at once), the longest-waiting first.
 pub fn due(conn: &Connection, now: &str, limit: usize) -> Result<Vec<CaptureState>> {

@@ -28,8 +28,14 @@ complete, which means one of these:
 - locally, the file has not changed for 5 minutes; on a server tenant, every upload that is not cut at its size cap
   closes the last turn.
 
-A last turn whose final tool call has no result yet stays open, except at a session end (or, locally, after 24 hours
-without a change).
+A last turn whose final tool call has no result yet stays open until the session ends. A session that never says so (it
+crashed, was killed, or its app was closed in the middle of a turn) is closed as if it had: once its transcript has not
+changed for **6 hours**, its last turn is stored, whatever it waits for, and the session ends. Locally the daemon's
+sweep does this, also for a session resumed after its end; on a server tenant the capture script does it at the first
+session start after those 6 hours (it sweeps only then). A session that goes on afterwards is captured as usual: its
+new turns are stored, a tool result that came late is stored as the rest of the closed turn, and nothing is stored
+twice. Locally, a new session's start waits up to 24 hours for its transcript (Claude Code writes it with the first
+message), so a session killed during its very first turn is closed the same way.
 
 So capture lags the live session by at most one turn. A compaction summary is a turn of its own.
 
@@ -326,8 +332,9 @@ policy again, for every project a request covers, and redacts the text with each
 
 ### What it does
 
-- **When.** A session is distilled when it ends (`SessionEnd`, or 24 hours without any event when it captured something
-  in the last 8 days; an older one waits for you to ask), when it is compacted (`PreCompact`), when it has been quiet
+- **When.** A session is distilled when it ends (`SessionEnd`, the close of a session left in the middle of a turn
+  after 6 hours, or 24 hours without any event when it captured something in the last 8 days; an older one waits for
+  you to ask), when it is compacted (`PreCompact`), when it has been quiet
   for `distill.idle_minutes` (default 15), or when you run `alice capture distill <session-id>`. A session you resume
   after it ended is open again from its first new turn: its quiet pauses do not count as ends, and its next end does.
 - **Extractive.** Jev answers choice questions only, so a distilled memory is **a passage of your session**, chosen and
@@ -486,8 +493,8 @@ report):
   as `global`. Aliases and merged or renamed projects are not matched, so give the base slug.
 
 Each session is filed under the project of the working directory its transcript records, as a hook's session would be.
-The daemon reads each file as its sweep does, complete turns only: a file idle for 24 hours is read to its end and its
-session marked ended, and one written to in the last 5 minutes keeps its last turn open until the sweep closes it. Live
+The daemon reads each file as its sweep does, complete turns only: a file idle for 24 hours (6 hours when its last turn
+was left open) is read to its end and its session marked ended, and one written to in the last 5 minutes keeps its last turn open until the sweep closes it. Live
 sessions' capture goes first; the backfill is read between their passes. Turn keys and the MemPalace rule below (Codex
 rollouts included) keep anything already stored or imported from coming back, so a backfill is safe to run again.
 
@@ -585,7 +592,7 @@ Other things you may see:
 |---|---|---|
 | Nothing in `alice capture status` after a session | The hooks load in new sessions only, or the daemon was not running | Start a new session; read `$ALICE_HOME/logs/hook.log` |
 | A line in `hook.log` | The hook ignored an input or could not reach the daemon (it spooled the notice) | Usually nothing; the daemon reads the transcript when it runs |
-| A session's last turn is missing | The trailing turn waits for the next turn, a stop event or 5 quiet minutes | Wait; it arrives |
+| A session's last turn is missing | The trailing turn waits for the next turn, a stop event or 5 quiet minutes; one whose tool call has no result yet waits for the session end, or for 6 hours without a change (on a server tenant, then the next session start) | Wait; it arrives |
 | `alice hooks install` refuses a file | `settings.json` (or `hooks.json`) is not valid JSON | Fix the file; nothing was changed |
 | `alice hooks install codex` refuses: "could not change … config.toml safely" | Codex's `config.toml` has hooks of its own in a form no table can extend (an inline list), or Alice entries added by hand | Fix what the message names, or add the hooks by hand; nothing was changed |
 | Codex captures nothing | The hooks are not trusted yet | Start Codex and choose **Trust all and continue** at "Hooks need review" (or trust the Alice entries in `/hooks`) |
