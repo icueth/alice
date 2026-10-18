@@ -14,7 +14,7 @@ use alice_daemon::service::{Service, ServiceOptions};
 use axum::body::Bytes;
 use serde_json::json;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1432,6 +1432,71 @@ impl Rollout {
                    "output": [{"type": "input_text", "text": text}]}),
         )
     }
+
+    /// A multi-agent message from `author` to `recipient`, with the metadata line before it
+    /// and, when `encrypted`, an opaque block after the text.
+    fn agent(&mut self, author: &str, recipient: &str, text: &str, encrypted: bool) -> &mut Self {
+        let mut content = vec![json!({"type": "input_text", "text": text})];
+        if encrypted {
+            content.push(json!({"type": "encrypted_content", "encrypted_content": "ZW5j"}));
+        }
+        let id = format!("am{}", self.clock);
+        self.line(
+            "inter_agent_communication_metadata",
+            json!({"trigger_turn": true}),
+        )
+        .line(
+            "response_item",
+            json!({"type": "agent_message", "id": id,
+                   "author": author, "recipient": recipient, "content": content,
+                   "internal_chat_message_metadata_passthrough": {"turn_id": "t1"}}),
+        )
+    }
+}
+
+/// Follow-up 2: a Codex multi-agent session's agent messages are captured as blocks of their turn
+/// (`[agent <author> → <recipient>]`), and none of their lines is counted as unrecognised or as
+/// bookkeeping, so `alice doctor` no longer warns about them.
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_agent_messages_are_captured_and_never_counted_as_drift() {
+    let (_d, svc) = tenant();
+    let mut r = Rollout::default();
+    r.line(
+        "session_meta",
+        json!({"id": "cxa", "cwd": "/home/user/project-x"}),
+    )
+    .prompt("Ask a reviewer to check the parser change.")
+    .reply("Starting a reviewer.")
+    .agent(
+        "/root/review_w1",
+        "/root",
+        "Reviewer one: agentquokka, no findings.",
+        true,
+    )
+    .line(
+        "response_item",
+        json!({"type": "agent_message", "author": "/root/review_w1", "recipient": "/root",
+               "content": [{"type": "encrypted_content", "encrypted_content": "b3Bh"}]}),
+    )
+    .reply("The review found nothing to fix.");
+    let a = send(&svc, codex_q("cxa", 0, "session-end"), &r.bytes).await;
+    assert_eq!((a.turns_stored, a.next_offset), (1, r.len()));
+    let texts: Vec<String> = chunks_of(&svc, "codex:session:cxa")
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("[agent /root/review_w1 → /root] Reviewer one: agentquokka")),
+        "{texts:?}"
+    );
+    let h = svc.health().await.unwrap().capture.unwrap();
+    assert_eq!(
+        (h.unrecognised_lines_7d, h.bookkeeping_lines_7d),
+        (0, 0),
+        "{h:?}"
+    );
 }
 
 fn codex_q(session: &str, offset: u64, event: &str) -> TranscriptQuery {
@@ -3847,6 +3912,340 @@ async fn a_subagent_stop_notify_reads_the_agent_file() {
         Some(agent_path.to_string_lossy().as_ref())
     );
     assert!(chunks_of(&svc, sub_uri)[0].1.contains("core crate"));
+}
+
+/// Subagent `agent` of the session whose transcript is `main`, where Claude Code writes it
+/// (`<main without .jsonl>/subagents/agent-<id>.jsonl`), with one turn naming `marker` (over
+/// 200 characters); with `held`, the turn ends on a tool call that never got its result.
+fn lost_subagent(main: &Path, session: &str, agent: &str, marker: &str, held: bool) -> PathBuf {
+    let path = main
+        .with_extension("")
+        .join(format!("subagents/agent-{agent}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut t = Transcript::subagent(agent);
+    let id = format!("{session}-{agent}");
+    t.prompt(
+        &format!("{id}-p"),
+        &format!(
+            "Survey {marker} and report. {}",
+            "Look at every module and its tests. ".repeat(6)
+        ),
+    );
+    if held {
+        t.tool_use(
+            &format!("{id}-a"),
+            &format!("toolu_{id}"),
+            &format!("sleep {marker}"),
+        );
+    } else {
+        t.reply(
+            &format!("{id}-a"),
+            &format!(
+                "Report on {marker}: {}",
+                "the module renders turns. ".repeat(6)
+            ),
+        );
+    }
+    std::fs::write(&path, &t.bytes).unwrap();
+    path
+}
+
+/// Follow-up 2: a subagent killed in its first run never sends SubagentStop, so the local
+/// daemon finds its transcript beside its session's: after the session's next pass, and in the
+/// sweep. The new source takes the session's project and follows every rule of a source: a turn
+/// quiet for 5 minutes is closed, one held for 6 hours gets the final pass. A later SubagentStop
+/// goes on from its cursor and stores nothing twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subagent_killed_in_its_first_run_is_found_beside_its_session() {
+    let (d, svc) = local();
+    let repo = d.path().join("lost-repo");
+    std::fs::create_dir(&repo).unwrap();
+    let main_path = d.path().join("ls.jsonl");
+    let mut main = Transcript::default();
+    main.turn("ls", 1, "the main session");
+    std::fs::write(&main_path, &main.bytes).unwrap();
+    let quiet = lost_subagent(&main_path, "ls", "lsq1", "quietsubquokka", false);
+    age(&quiet, Duration::from_secs(10 * 60));
+    let held = lost_subagent(&main_path, "ls", "lsh1", "heldsubquokka", true);
+    age(&held, Duration::from_secs(7 * 3600));
+    svc.capture_notify(CaptureNotify {
+        cwd: Some(repo.to_string_lossy().into_owned()),
+        ..notify("ls", &main_path, "stop")
+    })
+    .await
+    .unwrap();
+    let (q_uri, h_uri) = (
+        "claude-code:session:ls:agent:lsq1",
+        "claude-code:session:ls:agent:lsh1",
+    );
+    until("the quiet subagent's turn", || {
+        chunks_holding(&svc, "Report on quietsubquokka") == 1
+    })
+    .await;
+    until("the held subagent's final pass", || {
+        state_of(&svc, h_uri).is_some_and(|s| s.ended)
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "[tool Bash] sleep heldsubquokka"), 1);
+    let main_row = state_of(&svc, &uri("ls")).unwrap();
+
+    // Written after the session's last pass, with no event since: the sweep finds it.
+    let late = lost_subagent(&main_path, "ls", "lsl1", "latesubquokka", false);
+    age(&late, Duration::from_secs(10 * 60));
+    until("the sweep finds the late one", || {
+        chunks_holding(&svc, "Report on latesubquokka") == 1
+    })
+    .await;
+    // One too short to keep never gets a source, and is not looked at again and again.
+    let tiny = main_path
+        .with_extension("")
+        .join("subagents/agent-lst1.jsonl");
+    let mut t = Transcript::subagent("lst1");
+    t.prompt("ls-lst1-p", "Title?").reply("ls-lst1-a", "Fine.");
+    std::fs::write(&tiny, &t.bytes).unwrap();
+    age(&tiny, Duration::from_secs(10 * 60));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let settled = passes(&svc);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(passes(&svc), settled, "nothing is passed again and again");
+    assert!(state_of(&svc, "claude-code:session:ls:agent:lst1").is_none());
+
+    for sub in [q_uri, h_uri, "claude-code:session:ls:agent:lsl1"] {
+        let row = state_of(&svc, sub).unwrap();
+        assert_eq!(row.parent_source_id.as_ref(), Some(&main_row.source_id));
+        assert_eq!(row.project_slug, "lost-repo", "the session's project");
+    }
+
+    // The quiet one is resumed and stops this time: only its new turn is stored.
+    let mut t = Transcript::subagent("lsq1");
+    t.bytes = std::fs::read(&quiet).unwrap();
+    t.clock = 10;
+    t.prompt("ls-lsq1-p2", "Now the second part.").reply(
+        "ls-lsq1-a2",
+        &format!(
+            "Second report: {}",
+            "the cursor moves turn by turn. ".repeat(6)
+        ),
+    );
+    std::fs::write(&quiet, &t.bytes).unwrap();
+    svc.capture_notify(CaptureNotify {
+        agent_id: Some("lsq1".into()),
+        agent_transcript_path: Some(quiet.to_string_lossy().into_owned()),
+        ..notify("ls", &main_path, "subagent-stop")
+    })
+    .await
+    .unwrap();
+    until("the second report", || {
+        chunks_holding(&svc, "Second report") == 1
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "Report on quietsubquokka"), 1);
+    assert_eq!(state_of(&svc, q_uri).unwrap().byte_offset, t.len());
+}
+
+/// Lane 2 fix round 1, I1: a subagent too short to keep (an internal helper), found beside its
+/// session while its file is young and its one turn still open, is judged whole, as one sent
+/// by SubagentStop is: it is never registered and never stored, then or once its file is quiet.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_found_subagent_too_short_to_keep_is_never_registered() {
+    let (d, svc) = local();
+    let main_path = d.path().join("ts.jsonl");
+    let mut main = Transcript::default();
+    main.turn("ts", 1, "the main session");
+    std::fs::write(&main_path, &main.bytes).unwrap();
+    let tiny = main_path
+        .with_extension("")
+        .join("subagents/agent-tsh1.jsonl");
+    std::fs::create_dir_all(tiny.parent().unwrap()).unwrap();
+    let mut t = Transcript::subagent("tsh1");
+    t.prompt("ts-tsh1-p", "Title?").reply("ts-tsh1-a", "Fine.");
+    std::fs::write(&tiny, &t.bytes).unwrap();
+    let sub_uri = "claude-code:session:ts:agent:tsh1";
+    let before = passes(&svc);
+    svc.capture_notify(notify("ts", &main_path, "stop"))
+        .await
+        .unwrap();
+    until("the session's pass and the found one", || {
+        passes(&svc) >= before + 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(state_of(&svc, sub_uri).is_none(), "never registered");
+    // Quiet now: looked at again, judged again, still dropped.
+    age(&tiny, Duration::from_secs(10 * 60));
+    let aged = passes(&svc);
+    until("the quiet pass", || passes(&svc) > aged).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(state_of(&svc, sub_uri).is_none(), "never registered");
+    assert_eq!(chunks_holding(&svc, "Title?"), 0, "never stored");
+
+    // One long enough, whose one turn waits on a tool call, is registered while young (its whole
+    // rendering is judged), so the sweep gives it the 6-hour final pass later.
+    let held = lost_subagent(&main_path, "ts", "tsl1", "longheldquokka", true);
+    let held_uri = "claude-code:session:ts:agent:tsl1";
+    main.turn("ts", 2, "the main session goes on");
+    std::fs::write(&main_path, &main.bytes).unwrap();
+    svc.capture_notify(notify("ts", &main_path, "stop"))
+        .await
+        .unwrap();
+    until("registered while young", || {
+        state_of(&svc, held_uri).is_some()
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "sleep longheldquokka"), 0);
+    age(&held, Duration::from_secs(7 * 3600));
+    until("the 6-hour final pass", || {
+        state_of(&svc, held_uri).is_some_and(|s| s.ended)
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "[tool Bash] sleep longheldquokka"), 1);
+}
+
+/// Lane 2 fix round 1, review M3: a found subagent's file counts as looked at only once its pass
+/// has run. One whose pass could not read it (its permissions, for a while) is looked at again by
+/// a later round, although the file did not change.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_found_subagent_whose_pass_failed_is_looked_at_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let (d, svc) = local();
+    let main_path = d.path().join("fp.jsonl");
+    let mut main = Transcript::default();
+    main.turn("fp", 1, "the main session");
+    std::fs::write(&main_path, &main.bytes).unwrap();
+    let sub = lost_subagent(&main_path, "fp", "fpa1", "failedpassquokka", false);
+    age(&sub, Duration::from_secs(10 * 60));
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&sub).is_ok() {
+        eprintln!("skipped: this user reads a file of mode 000 (root)");
+        return;
+    }
+    let before = passes(&svc);
+    svc.capture_notify(notify("fp", &main_path, "stop"))
+        .await
+        .unwrap();
+    until("the session's pass", || passes(&svc) > before).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(chunks_holding(&svc, "failedpassquokka"), 0);
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o644)).unwrap();
+    until("a later round looks again", || {
+        chunks_holding(&svc, "Report on failedpassquokka") == 1
+    })
+    .await;
+}
+
+/// Lane 2 fix round 1, review M4: with `capture.include_subagents = false` the search starts
+/// nothing (each such pass would only be dropped).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_search_starts_nothing_while_subagent_capture_is_off() {
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        AliceHome::new(home.clone()).config_file(),
+        "[capture]\ninclude_subagents = false\n",
+    )
+    .unwrap();
+    let svc = start_with(&home, local_options());
+    let main_path = d.path().join("so.jsonl");
+    let mut main = Transcript::default();
+    main.turn("so", 1, "the main session");
+    std::fs::write(&main_path, &main.bytes).unwrap();
+    let sub = lost_subagent(&main_path, "so", "soa1", "offsubquokka", false);
+    age(&sub, Duration::from_secs(10 * 60));
+    let before = passes(&svc);
+    svc.capture_notify(notify("so", &main_path, "stop"))
+        .await
+        .unwrap();
+    until("the session's pass", || passes(&svc) > before).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(passes(&svc), before + 1, "only the session's own pass");
+}
+
+/// Follow-up 2: the search leaves a backfilled session's subagents to the backfill, which lists
+/// them itself and registers them as backfilled (not distilled unless asked): neither the
+/// session's pass nor a sweep starts them as live sources.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backfilled_sessions_subagents_are_left_to_the_backfill() {
+    let (d, svc) = local();
+    let main_path = d.path().join("bf.jsonl");
+    let mut main = Transcript::default();
+    main.turn("bf", 1, "the backfilled session");
+    std::fs::write(&main_path, &main.bytes).unwrap();
+    let sub = lost_subagent(&main_path, "bf", "bfa1", "backfilledsubquokka", false);
+    // Two hours old: the backfilled session stays open, so the sweep looks at it too.
+    age(&main_path, Duration::from_secs(2 * 3600));
+    age(&sub, Duration::from_secs(2 * 3600));
+    let backfill = |agent: Option<(&str, &Path)>| CaptureNotify {
+        agent_id: agent.map(|(id, _)| id.to_string()),
+        agent_transcript_path: agent.map(|(_, p)| p.to_string_lossy().into_owned()),
+        ..notify("bf", &main_path, "backfill")
+    };
+    let before = passes(&svc);
+    svc.capture_notify(backfill(None)).await.unwrap();
+    until("the session is backfilled", || {
+        passes(&svc) > before
+            && state_of(&svc, &uri("bf")).is_some_and(|s| s.distill_state == "skipped_backfill")
+    })
+    .await;
+    assert!(!state_of(&svc, &uri("bf")).unwrap().ended);
+    // Several sweeps (every 100 ms here) go by.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let sub_uri = "claude-code:session:bf:agent:bfa1";
+    assert!(state_of(&svc, sub_uri).is_none(), "left to the backfill");
+    svc.capture_notify(backfill(Some(("bfa1", &sub))))
+        .await
+        .unwrap();
+    until("the backfill registers it", || {
+        state_of(&svc, sub_uri).is_some()
+    })
+    .await;
+    assert_eq!(
+        state_of(&svc, sub_uri).unwrap().distill_state,
+        "skipped_backfill"
+    );
+}
+
+/// Follow-up 2: one round of the search (a pass of the session, or a sweep) starts at most five
+/// subagent sources; a session with more is finished by later rounds. The sweep runs once an
+/// hour here, so only the session's passes look.
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_subagents_are_found_five_at_a_time() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            capture_sweep_every: Duration::from_secs(3600),
+            ..local_options()
+        },
+    );
+    let main_path = d.path().join("lf.jsonl");
+    let mut main = Transcript::default();
+    main.turn("lf", 1, "the main session");
+    std::fs::write(&main_path, &main.bytes).unwrap();
+    let ids: Vec<String> = (0..7).map(|i| format!("lfa{i}")).collect();
+    for id in &ids {
+        lost_subagent(&main_path, "lf", id, &format!("{id}quokka"), false);
+    }
+    let found = || {
+        ids.iter()
+            .filter(|id| state_of(&svc, &format!("claude-code:session:lf:agent:{id}")).is_some())
+            .count()
+    };
+    let before = passes(&svc);
+    svc.capture_notify(notify("lf", &main_path, "stop"))
+        .await
+        .unwrap();
+    until("five found", || found() == 5).await;
+    until("their passes ran", || passes(&svc) >= before + 6).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(found(), 5, "one round starts five");
+    main.turn("lf", 2, "the main session goes on");
+    std::fs::write(&main_path, &main.bytes).unwrap();
+    svc.capture_notify(notify("lf", &main_path, "stop"))
+        .await
+        .unwrap();
+    until("all seven found", || found() == 7).await;
 }
 
 /// Ruling 6: a Codex hook may give no transcript path. The worker looks for

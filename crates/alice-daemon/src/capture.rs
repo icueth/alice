@@ -470,12 +470,27 @@ impl CaptureCtl {
             report.verdict = Some(verdict);
             return Ok(report);
         }
-        if input.subagent.is_some() && state.is_none() && input.offset == 0 && out.consumed > 0 {
-            let chars: usize = out
+        // Spec §3.4: a subagent with nothing stored yet is judged whole, its open turn included
+        // (one found beside its session may come before its turn closes), so one whose whole
+        // rendering is under 200 characters is dropped before any source is registered for it.
+        if input.subagent.is_some() && state.is_none() && input.offset == 0 {
+            let forced;
+            let whole = if opts.force_close {
+                &out
+            } else {
+                let closed = ReadOptions {
+                    close_trailing: true,
+                    force_close: true,
+                    ..opts.clone()
+                };
+                forced = capture::read_redacted(input.agent, bytes, &closed, &redactor);
+                &forced
+            };
+            let chars: usize = whole
                 .turns
                 .iter()
                 .flat_map(|t| &t.chunks)
-                .chain(&out.tail)
+                .chain(&whole.tail)
                 .map(|c| c.text.chars().count())
                 .sum();
             if chars < MIN_SUBAGENT_CHARS {
@@ -1302,6 +1317,7 @@ mod local {
     use alice_core::store::ReaderPool;
     use alice_core::store::capture as store;
     use alice_core::store::capture::CaptureState;
+    use alice_core::store::projects;
     use alice_core::{AliceError, Result};
     use axum::body::Bytes;
     use parking_lot::Mutex;
@@ -1342,6 +1358,10 @@ mod local {
     /// The ended sources are looked at every this many sweeps (and at the first): every 10
     /// minutes with the default `sweep_every`. The 6-hour close needs no more.
     const ENDED_EVERY: u64 = 10;
+    /// Subagent sources the search beside a session starts in one round (a pass of the session,
+    /// or a sweep) at most, the tenant script's per-sweep limit too; a session with more is
+    /// finished over later rounds.
+    const DISCOVER_PER_ROUND: usize = 5;
 
     /// How a pass treats the transcript's trailing turn (ruling 1). Ordered: a stronger close
     /// is never replaced by a weaker one.
@@ -1368,6 +1388,9 @@ mod local {
         pub path: Option<PathBuf>,
         /// The session's working directory: a new source's project.
         pub cwd: Option<String>,
+        /// A new source's project by its slug, before `cwd`: a subagent the search found beside
+        /// its session takes the session's.
+        pub project: Option<String>,
         /// The event behind the pass (`capture_state.last_event`).
         pub event: String,
         pub close: Close,
@@ -1405,6 +1428,9 @@ mod local {
             }
             if newer.cwd.is_some() {
                 self.cwd = newer.cwd;
+            }
+            if newer.project.is_some() {
+                self.project = newer.project;
             }
         }
     }
@@ -1490,6 +1516,7 @@ mod local {
             subagent,
             path,
             cwd: n.cwd.filter(|c| !c.trim().is_empty()),
+            project: None,
             event: n.event,
             close,
             end,
@@ -1567,6 +1594,14 @@ mod local {
         /// ever comes) still gets a source the sweep closes. Dropped once the source exists, or
         /// `stale` after the start.
         starting: Mutex<HashMap<String, (Job, Instant)>>,
+        /// Subagent transcripts the search beside a session looked at, by their source's uri,
+        /// with the file as it was then: not looked at again while it stays so (one with a
+        /// source, or one whose pass ran, too short to keep, which never gets one). Kept for open
+        /// sessions only.
+        discovered: Mutex<HashMap<String, FileSeen>>,
+        /// Subagents the search queued a pass for: the pass that ran (`Done`) adds its file to
+        /// `discovered`; one that could not run leaves it to a later round.
+        found: Mutex<HashSet<String>>,
         /// bounded(1): notifications that arrive together wake the thread once.
         wake_tx: crossbeam_channel::Sender<()>,
         wake_rx: crossbeam_channel::Receiver<()>,
@@ -1596,6 +1631,8 @@ mod local {
                 cfg,
                 pending: Mutex::new(HashMap::new()),
                 starting: Mutex::new(HashMap::new()),
+                discovered: Mutex::new(HashMap::new()),
+                found: Mutex::new(HashSet::new()),
                 wake_tx,
                 wake_rx,
                 stop: AtomicBool::new(false),
@@ -1698,10 +1735,14 @@ mod local {
                     let uri = job.uri();
                     let run = std::panic::AssertUnwindSafe(|| self.run_job(job, &mut seen));
                     match std::panic::catch_unwind(run) {
-                        Ok(outcome) => closes.ran(&uri, &outcome),
+                        Ok(outcome) => {
+                            closes.ran(&uri, &outcome);
+                            self.found_ran(&uri, &outcome);
+                        }
                         Err(_) => {
                             seen.remove(&uri);
                             closes.ran(&uri, &Outcome::Retry);
+                            self.found_ran(&uri, &Outcome::Retry);
                             tracing::error!(
                                 uri,
                                 "a capture pass panicked; the next event or sweep tries it again"
@@ -1807,6 +1848,132 @@ mod local {
             }
             if !unreadable.is_empty() {
                 self.end_unreadable(&unreadable, open.len(), seen)?;
+            }
+            // The subagents of the open Claude Code sessions that no event brought.
+            let mains: HashSet<&str> = open
+                .iter()
+                .filter(|s| {
+                    s.agent == AgentKind::ClaudeCode.as_str()
+                        && s.parent_source_id.is_none()
+                        // A backfilled session's subagents come with its backfill.
+                        && s.distill_state != store::DistillState::SkippedBackfill
+                })
+                .map(|s| s.uri.as_str())
+                .collect();
+            self.discovered.lock().retain(|uri, _| {
+                uri.split_once(":agent:")
+                    .is_some_and(|(m, _)| mains.contains(m))
+            });
+            let mut budget = DISCOVER_PER_ROUND;
+            for s in open.iter().filter(|s| mains.contains(s.uri.as_str())) {
+                if budget == 0 || self.stopping() {
+                    break;
+                }
+                if let Some(path) = s.transcript_path.as_deref() {
+                    self.discover(&s.session_id, Path::new(path), &s.project_id, &mut budget)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// A job of `uri` ended with `outcome`: a pass the search queued that ran puts its file
+        /// in `discovered` (review M3), one back in the queue stays found, and one that could not
+        /// run is left to a later round.
+        fn found_ran(&self, uri: &str, outcome: &Outcome) {
+            if let Outcome::Requeued = outcome {
+                return;
+            }
+            if !self.found.lock().remove(uri) {
+                return;
+            }
+            if let Outcome::Done(s) = outcome {
+                let file = FileSeen {
+                    len: s.len,
+                    mtime: s.mtime,
+                };
+                self.discovered.lock().insert(uri.to_owned(), file);
+            }
+        }
+
+        /// Starts a source for each subagent transcript Claude Code wrote beside session
+        /// `session`'s (`<main without .jsonl>/subagents/agent-<id>.jsonl`) that has none yet: a
+        /// subagent killed in its first run never sends SubagentStop (follow-up 2). Its job
+        /// registers the source as a `session-start` does (its one turn may still be open),
+        /// closes by the transcript's idle time as a sweep's does, and takes the session's
+        /// project (`project_id`). At most `budget` are started; the rest wait for a later
+        /// round. A transcript looked at already is not again while it stays as it was.
+        fn discover(
+            &self,
+            session: &str,
+            main: &Path,
+            project_id: &str,
+            budget: &mut usize,
+        ) -> Result<()> {
+            // Review M4: with subagent capture off, every such pass would only be dropped.
+            if !self.ctl.settings.get().capture.include_subagents {
+                return Ok(());
+            }
+            let Ok(entries) = std::fs::read_dir(main.with_extension("").join("subagents")) else {
+                return Ok(());
+            };
+            let mut found: Vec<(String, PathBuf)> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().into_string().ok()?;
+                    let id = name.strip_prefix("agent-")?.strip_suffix(".jsonl")?;
+                    capture::valid_id(id).then(|| (id.to_owned(), e.path()))
+                })
+                .collect();
+            found.sort();
+            let mut project = None;
+            for (id, path) in found {
+                if *budget == 0 {
+                    break;
+                }
+                let uri = AgentKind::ClaudeCode.source_uri(session, Some(&id));
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                let file = FileSeen {
+                    len: meta.len(),
+                    mtime: meta.modified().ok(),
+                };
+                if !meta.is_file()
+                    || self.discovered.lock().get(&uri) == Some(&file)
+                    || self.pending.lock().contains_key(&uri)
+                {
+                    continue;
+                }
+                if self.readers.with(|c| store::by_uri(c, &uri))?.is_some() {
+                    self.discovered.lock().insert(uri, file);
+                    continue;
+                }
+                self.found.lock().insert(uri.clone());
+                if project.is_none() {
+                    project = Some(
+                        self.readers
+                            .with(|c| projects::get_by_id(c, project_id))?
+                            .slug,
+                    );
+                }
+                tracing::info!(
+                    uri,
+                    "a subagent's transcript no event brought was found beside its session's; it is captured"
+                );
+                self.notify(Job {
+                    agent: AgentKind::ClaudeCode,
+                    session: session.to_owned(),
+                    subagent: Some(id),
+                    path: Some(path),
+                    cwd: None,
+                    project: project.clone(),
+                    event: "session-start".into(),
+                    close: Close::Open,
+                    end: false,
+                    by_age: true,
+                    not_before: Instant::now(),
+                });
+                *budget -= 1;
             }
             Ok(())
         }
@@ -1955,7 +2122,30 @@ mod local {
             let Some(path) = self.transcript(&job) else {
                 return Outcome::Retry;
             };
-            match self.passes(&uri, &job, &path) {
+            let outcome = self.passes(&uri, &job, &path);
+            // A pass of a Claude Code session also looks for its subagents no event brought, unless
+            // a backfill registered the session: a backfill lists the subagents itself (and
+            // registers them as backfilled).
+            if job.agent == AgentKind::ClaudeCode && job.subagent.is_none() && !self.stopping() {
+                let found = self
+                    .readers
+                    .with(|c| store::by_uri(c, &uri))
+                    .and_then(|main| {
+                        let mut budget = DISCOVER_PER_ROUND;
+                        match main {
+                            Some(m) if m.distill_state != store::DistillState::SkippedBackfill => {
+                                self.discover(&job.session, &path, &m.project_id, &mut budget)
+                            }
+                            Some(_) => Ok(()),
+                            // No source yet: its subagents wait for the pass that registers it.
+                            None => Ok(()),
+                        }
+                    });
+                if let Err(e) = found {
+                    tracing::warn!(uri, error = %e, "the search for a session's subagents failed; the next pass or sweep looks again");
+                }
+            }
+            match outcome {
                 Ok(Outcome::Done(s)) => {
                     seen.insert(uri, s);
                     Outcome::Done(s)
@@ -2023,7 +2213,9 @@ mod local {
         fn passes(&self, uri: &str, job: &Job, path: &Path) -> Result<Outcome> {
             // A new source's project; an existing one keeps its own (spec §3.1). Git runs at
             // most once a minute per directory.
-            let project = self.resolver.choose(None, job.cwd.as_deref());
+            let project = self
+                .resolver
+                .choose(job.project.as_deref(), job.cwd.as_deref());
             // Where the next pass starts, past a line longer than a pass.
             let mut skip_to = None;
             for _ in 0..PASSES_PER_TURN {
@@ -2229,6 +2421,7 @@ mod local {
             subagent,
             path: Some(PathBuf::from(path)),
             cwd: None,
+            project: None,
             event: "sweep".into(),
             close: Close::Open,
             end: false,

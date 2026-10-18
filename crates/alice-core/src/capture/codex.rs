@@ -199,9 +199,58 @@ fn response_item(timestamp: Option<String>, mut payload: Map<String, Value>) -> 
             ))
         }
         "function_call_output" | "custom_tool_call_output" => tool_output(timestamp, payload),
+        "agent_message" => agent_message(timestamp, payload),
         // Known items with nothing to keep.
         "ghost_snapshot" | "compaction" => LineResult::Record(skip(timestamp)),
         _ => LineResult::Unknown,
+    }
+}
+
+/// A message between agents of a multi-agent session: its text blocks, joined by `\n`, as one
+/// block of the turn it occurs in (it never starts one). `encrypted_content` is opaque, so it is
+/// skipped; any other block type is drift, as in a `message`.
+fn agent_message(timestamp: Option<String>, mut payload: Map<String, Value>) -> LineResult {
+    let Some(Value::Array(items)) = payload.remove("content") else {
+        return LineResult::Unknown;
+    };
+    let mut texts = Vec::new();
+    let mut unknown = false;
+    for item in items {
+        let Value::Object(mut block) = item else {
+            unknown = true;
+            continue;
+        };
+        match block.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text" | "text") => match block.remove("text") {
+                Some(Value::String(text)) if !text.is_empty() => texts.push(text),
+                Some(Value::String(_)) => {}
+                _ => unknown = true,
+            },
+            Some("encrypted_content") => {}
+            _ => unknown = true,
+        }
+    }
+    if texts.is_empty() {
+        return if unknown {
+            LineResult::Unknown
+        } else {
+            LineResult::Record(skip(timestamp))
+        };
+    }
+    let rec = record(
+        timestamp,
+        None,
+        RecordKind::Assistant,
+        vec![Block::AgentMessage {
+            author: string(&payload, "author").unwrap_or_default(),
+            recipient: string(&payload, "recipient").unwrap_or_default(),
+            text: texts.join("\n"),
+        }],
+    );
+    if unknown {
+        LineResult::Drift(rec)
+    } else {
+        LineResult::Record(rec)
     }
 }
 
@@ -674,6 +723,64 @@ mod tests {
         );
     }
 
+    /// Follow-up 2: a multi-agent message (`response_item` / `agent_message`) is read as a block
+    /// of the turn it occurs in, with its author and recipient. An `encrypted_content` block is
+    /// opaque and skipped (no drift); an encrypted-only message leaves nothing to keep; an
+    /// unknown block beside known ones is drift, as in any message.
+    #[test]
+    fn agent_messages_are_read_with_their_author_and_recipient() {
+        let msg = |content: Value| {
+            parse(item(
+                json!({"type": "agent_message", "id": "am1", "author": "/root/review_w1",
+                "recipient": "/root", "content": content,
+                "internal_chat_message_metadata_passthrough": {"turn_id": "t1"}}),
+            ))
+        };
+        let LineResult::Record(r) = msg(json!([
+            {"type": "input_text", "text": "Review done: two findings."},
+            {"type": "encrypted_content", "encrypted_content": "ZW5j"},
+        ])) else {
+            panic!("a record")
+        };
+        assert_eq!(r.kind, RecordKind::Assistant);
+        assert!(!r.starts_turn(), "an agent message never starts a turn");
+        assert_eq!(
+            r.blocks,
+            [Block::AgentMessage {
+                author: "/root/review_w1".into(),
+                recipient: "/root".into(),
+                text: "Review done: two findings.".into(),
+            }]
+        );
+        let LineResult::Record(r) = msg(json!([
+            {"type": "input_text", "text": "Part one."},
+            {"type": "input_text", "text": "Part two."},
+        ])) else {
+            panic!("a record")
+        };
+        assert_eq!(
+            r.blocks,
+            [Block::AgentMessage {
+                author: "/root/review_w1".into(),
+                recipient: "/root".into(),
+                text: "Part one.\nPart two.".into(),
+            }]
+        );
+        // Encrypted only: known, nothing to keep.
+        let r = record_of(item(json!({"type": "agent_message", "author": "/root",
+            "recipient": "/root/w2", "content": [{"type": "encrypted_content",
+            "encrypted_content": "ZW5j"}]})));
+        assert_eq!(r.kind, RecordKind::Skip);
+        assert!(r.blocks.is_empty());
+        // An unknown block beside a known one: kept, and drift; alone: unknown.
+        assert!(matches!(
+            msg(json!([{"type": "input_text", "text": "Hi."}, {"type": "hologram"}])),
+            LineResult::Drift(_)
+        ));
+        assert_eq!(msg(json!([{"type": "hologram"}])), LineResult::Unknown);
+        assert_eq!(msg(json!("not blocks")), LineResult::Unknown);
+    }
+
     /// The multi-agent metadata line of newer builds (FORMAT.md "`type` / `payload` mapping"):
     /// known, so dropped as a `Skip` record, not left to the bookkeeping rule.
     #[test]
@@ -756,7 +863,7 @@ mod tests {
         assert_eq!(line(json!(["words"])), LineResult::Unknown);
         assert_eq!(
             parse(item(
-                json!({"type": "agent_message", "author": "a", "recipient": "b",
+                json!({"type": "future_message", "author": "a", "recipient": "b",
                               "content": [{"type": "input_text", "text": "words"}]})
             )),
             LineResult::Unknown

@@ -44,7 +44,8 @@
 # Files, under ~/.config/alice (0700; every file 0600, this script 0700):
 #   token, url         read only, never written here (the team's setup document or setup.sh)
 #   capture.conf       briefing=on|off
-#   state/<agent>-<session>[-<agent_id>].offset   (<agent> is claude-code or codex)
+#   state/<agent>-<session>[-<agent_id>].offset   (<agent> is claude-code or codex; a Codex
+#                      sub-agent's id is its rollout's own id, not the hook's agent_id)
 #                      "<offset> <path>", then session, subagent, cwd, seen (when the transcript
 #                      was last there), and hold/closed/stopped lines; its mtime is set back to
 #                      1971 while work is left, so a sweep sees the transcript as newer
@@ -358,10 +359,23 @@ hook_main() {
       ;;
   esac
   # A subagent's own transcript is its own source; anything less is the main session's.
-  if [ "$h_event" != subagent-stop ] || ! valid_id "$h_sub" || [ "$h_agent" = codex ]; then
-    h_sub=
+  if [ "$h_event" != subagent-stop ]; then h_sub=; fi
+  case $h_subpath in /*.zst) h_sub= ;; /*) ;; *) h_sub= ;; esac
+  # Codex names a sub-agent's own rollout the same way (its session_id is the parent's). The
+  # sub-agent is known by the rollout's own id, the thread id its name ends with, never by
+  # agent_id, which a session may give a second sub-agent once the first is done: a new rollout
+  # is a new state, read from its start (the worker checks the rollout's first line names it).
+  if [ -n "$h_sub" ] && [ "$h_agent" = codex ]; then
+    h_sub=${h_subpath##*/}
+    case $h_sub in
+      rollout-????-??-??T??-??-??-*.jsonl)
+        h_sub=${h_sub#rollout-????-??-??T??-??-??-}
+        h_sub=${h_sub%.jsonl}
+        ;;
+      *) h_sub= ;;
+    esac
   fi
-  case $h_subpath in /*) ;; *) h_sub= ;; esac
+  valid_id "$h_sub" || h_sub=
   if [ -f "$0" ]; then
     if [ -n "$h_sub" ]; then
       nohup sh "$0" run "$h_agent" "$h_event" "$h_session" "$h_path" "$h_cwd" "$h_sub" "$h_subpath" \
@@ -868,6 +882,44 @@ capture_one() {
   return 0
 }
 
+# The subagent transcripts Claude Code wrote for main session $1 (transcript $2, working
+# directory $3) that no state knows yet. A subagent killed in its first run (an app restart, a
+# limit hit) never sends SubagentStop, so its session's events find it. Each is sent as a sweep
+# sends a transcript, under the state key SubagentStop uses (a later SubagentStop goes on from
+# there, and nothing is stored twice), and then follows the rules of any state (the 6-hour
+# close among them). At most $dv_left uploads per event; the rest wait for a later one.
+discover() {
+  dv_dir=${2%.jsonl}/subagents
+  [ -d "$dv_dir" ] || return 0
+  for dv_f in "$dv_dir"/agent-*.jsonl; do
+    [ "$dv_left" -gt 0 ] || return 0
+    paused && return 0
+    [ -f "$dv_f" ] || continue
+    dv_id=${dv_f##*/agent-}
+    dv_id=${dv_id%.jsonl}
+    valid_id "$dv_id" || continue
+    [ ! -f "$STATE/claude-code-$1-$dv_id.offset" ] || continue
+    # Unchanged for 5 minutes: one still running is left to its own SubagentStop, so its
+    # trailing turn is not closed mid-way (a later event finds a killed one).
+    [ -n "$(find "$dv_f" -prune -mmin +5 2>/dev/null)" ] || continue
+    capture_one "claude-code-$1-$dv_id" sweep "$1" "$dv_id" "$dv_f" "$3" 0
+    if [ -n "$co_sent" ]; then dv_left=$((dv_left - 1)); fi
+  done
+}
+
+# The SessionStart sweep's search for lost subagents: those of every main Claude Code session
+# that has a state.
+discover_all() {
+  for da_st in "$STATE"/claude-code-*.offset; do
+    [ "$dv_left" -gt 0 ] || return 0
+    [ -f "$da_st" ] || continue
+    read_state "$da_st" || continue
+    [ -z "$s_sub" ] && [ -z "$s_stopped" ] && valid_id "$s_session" || continue
+    [ -d "${s_path%.jsonl}/subagents" ] || continue
+    discover "$s_session" "$s_path" "$s_cwd"
+  done
+}
+
 # SessionStart: finish up to five other transcripts that grew while nothing sent them, or that
 # were left held for 6 hours.
 sweep() {
@@ -936,7 +988,14 @@ run_main() {
   self_update
   # The transcript may lag the event that names it.
   if [ "$r_event" != session-start ]; then sleep 2; fi
-  if [ "$r_agent" = codex ] && [ -z "$r_path" ]; then
+  # A Codex sub-agent's rollout must hold its own id (the one its name gives) on its first line.
+  if [ "$r_agent" = codex ] && [ -n "$r_sub" ] &&
+    ! head -n 1 "$r_subpath" 2>/dev/null | grep -q "\"id\"[[:space:]]*:[[:space:]]*\"$r_sub\""; then
+    log "session $r_session: the sub-agent's rollout does not name its own id on its first line; the parent's rollout is sent instead"
+    r_sub=
+  fi
+  # The parent's rollout is looked for only when it is the one sent.
+  if [ "$r_agent" = codex ] && [ -z "$r_path" ] && [ -z "$r_sub" ]; then
     r_path=$(find_rollout "$r_session")
     if [ -z "$r_path" ]; then
       log "session $r_session: no rollout file for this session in the newest seven day folders under \$CODEX_HOME/sessions; the next event looks again"
@@ -950,6 +1009,13 @@ run_main() {
   fi
   if [ "$r_event" = session-start ]; then
     sweep "$r_agent-$r_session"
+  fi
+  # A main Claude Code session's event looks for its subagents that no state knows (the
+  # SessionStart sweep for every session's), at most SWEEP_MAX uploads.
+  dv_left=$SWEEP_MAX
+  if [ "$r_agent" = claude-code ] && [ -z "$r_sub" ] && [ -n "$r_path" ]; then
+    discover "$r_session" "$r_path" "$r_cwd"
+    if [ "$r_event" = session-start ]; then discover_all; fi
   fi
   return 0
 }

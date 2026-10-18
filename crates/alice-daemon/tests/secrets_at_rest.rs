@@ -505,6 +505,118 @@ async fn a_captured_secret_is_stored_as_written_and_distillation_never_sends_it(
     l.svc.shutdown();
 }
 
+/// Follow-up 2: a Codex multi-agent session whose agent message holds a token. A store that
+/// keeps secrets keeps it as written in the `[agent …]` block, one that redacts stores the
+/// marker, and in both no request to Jev or to the remote embedder holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_in_a_codex_agent_message_is_kept_or_redacted_and_never_reaches_the_cloud() {
+    let line = |kind: &str, ts: u32, payload: serde_json::Value| {
+        let mut b = serde_json::to_vec(
+            &json!({"timestamp": format!("2026-10-17T10:00:{ts:02}.000Z"),
+            "ordinal": ts, "type": kind, "payload": payload}),
+        )
+        .unwrap();
+        b.push(b'\n');
+        b
+    };
+    let message = |role: &str, kind: &str, text: &str| {
+        let block = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        json!({"type": "message", "role": role, "content": [{"type": block, "text": text}],
+               "internal_chat_message_metadata_passthrough": {"content_item_kinds": [kind]}})
+    };
+    let mut bytes = line(
+        "session_meta",
+        0,
+        json!({"id": "cxs", "cwd": "/home/user/ops"}),
+    );
+    bytes.extend(line(
+        "response_item",
+        1,
+        message(
+            "user",
+            "user.text",
+            "How should the ops box deploy from now on? Ask the deploy agent.",
+        ),
+    ));
+    bytes.extend(line(
+        "response_item",
+        2,
+        json!({"type": "agent_message", "author": "/root/deploy", "recipient": "/root",
+               "content": [{"type": "input_text", "text": format!(
+                   "We decided to deploy the ops box with the bot token {TOKEN} from now on.")},
+                   {"type": "encrypted_content", "encrypted_content": "ZW5j"}]}),
+    ));
+    bytes.extend(line(
+        "response_item",
+        3,
+        message(
+            "assistant",
+            "unknown",
+            "We decided the ops box deploys with the deploy agent's bot token from now on.",
+        ),
+    ));
+    for (config, kept) in [(KEEPING, true), (REDACTING, false)] {
+        let l = Local::start_with(config);
+        let answer = l
+            .svc
+            .capture_transcript(
+                TranscriptQuery {
+                    agent: "codex".into(),
+                    session: "cxs".into(),
+                    offset: 0,
+                    event: "session-end".into(),
+                    cwd: Some(l.repo("ops")),
+                    ..Default::default()
+                },
+                axum::body::Bytes::from(bytes.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_else(|c| panic!("refused behind the cursor {c}"));
+        assert_eq!(answer.turns_stored, 1);
+        let held = |needle: &str| {
+            l.count(&format!(
+                "SELECT count(*) FROM chunks WHERE instr(text, '[agent /root/deploy → /root]') > 0
+                   AND instr(text, '{needle}') > 0"
+            ))
+        };
+        if kept {
+            assert_eq!(held(TOKEN), 1, "kept as written in the agent's block");
+        } else {
+            assert_eq!(held(TOKEN), 0);
+            assert_eq!(
+                held("[REDACTED:github_token]"),
+                1,
+                "redacted in the agent's block"
+            );
+        }
+        until("the session is distilled", || {
+            l.count(
+                "SELECT count(*) FROM capture_state WHERE distill_state = 'done' AND session_id = 'cxs'",
+            ) == 1
+        })
+        .await;
+        until("the chunks are embedded", || {
+            l.count("SELECT count(*) FROM chunks WHERE embed_state <> 'done'") == 0
+        })
+        .await;
+        assert!(!l.jev.bodies.lock().is_empty(), "distillation asked Jev");
+        assert!(
+            l.embedded
+                .lock()
+                .iter()
+                .any(|t| t.contains("[agent /root/deploy")),
+            "the agent's chunk was embedded"
+        );
+        l.assert_no_secret_left();
+        l.svc.shutdown();
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Re-review N1: capture's trims and cuts in a store that keeps secrets as written. A secret
 // whose detector needs context in another token or on another line (a URL's scheme and user,

@@ -878,13 +878,14 @@ fn parse_head(line: &str) -> Option<(Tag, bool, &str)> {
         "[result]" => (Tag::Result, after),
         "[result error]" => (Tag::ResultError, after),
         "[summary]" => (Tag::Summary, after),
-        "[tool " | "[subagent " => {
+        "[tool " | "[subagent " | "[agent " => {
             let close = after.find(']')?;
             let name = after[..close].to_owned();
-            let tag = if start == "[tool " {
-                Tag::Tool(name)
-            } else {
-                Tag::Subagent(name)
+            let tag = match start {
+                "[tool " => Tag::Tool(name),
+                "[subagent " => Tag::Subagent(name),
+                // A message between agents (Codex): a block of its own, not a candidate.
+                _ => Tag::Other,
             };
             (tag, &after[close + 1..])
         }
@@ -2575,6 +2576,28 @@ mod tests {
             .flat_map(|i| [User(&prompts[i]), Say(&replies[i])])
             .collect();
         prepare(&run(render(&steps), vec![], closes_session))
+    }
+
+    /// Follow-up 2: an `[agent …]` line (a Codex multi-agent message) is a block of its own. It
+    /// never runs on into the block before it, so the turn's conclusion is its last assistant
+    /// block without the agent's text, and the agent's message is no candidate.
+    #[test]
+    fn an_agent_message_line_is_a_block_of_its_own() {
+        let main = vec![format!(
+            "[user] Ask two reviewers to check the parser change.\n[assistant] The fix is in: {}.\n[agent /root/review_w1 → /root] Reviewer one: {} no findings.",
+            words(7, 16),
+            words(8, 16)
+        )];
+        let p = prepare(&run(main, vec![], false));
+        let texts: Vec<&str> = p.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| t.starts_with("The fix is in")),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Reviewer one")),
+            "{texts:?}"
+        );
     }
 
     #[test]

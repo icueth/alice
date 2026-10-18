@@ -46,6 +46,8 @@ use crate::redact::Redactor;
 ///   gets one space in front;
 /// - a subagent call is `[subagent <type>] <description>`, and its final report is a second
 ///   `[subagent <type>] <report>` line (the distiller takes the report);
+/// - a message between agents of a multi-agent session (Codex) is
+///   `[agent <author> → <recipient>] <text>`, with the agents' paths (`/root/review_w1`);
 /// - an unrecognised or unanswered-in-this-render tool result is `[result]`, at most 300
 ///   characters.
 pub const TAGS: &[&str] = &[
@@ -56,6 +58,7 @@ pub const TAGS: &[&str] = &[
     "[result error]",
     "[summary]",
     "[subagent ",
+    "[agent ",
 ];
 
 /// Alice's and MemPalace's own tools: their input becomes a title and their result is omitted,
@@ -675,6 +678,17 @@ fn pieces(
                         lines.push((media_tag.into(), what.into()));
                     }
                 }
+                Block::AgentMessage {
+                    author,
+                    recipient,
+                    text,
+                } => {
+                    if let Some(body) = clean(text, &mut scrub) {
+                        let tag =
+                            format!("[agent {} → {}]", agent_name(author), agent_name(recipient));
+                        lines.push((tag, body));
+                    }
+                }
                 Block::TooLarge => {
                     lines.push(("[result]".into(), "[record skipped: too large]".into()));
                 }
@@ -693,6 +707,13 @@ fn pieces(
         }
     }
     out
+}
+
+/// An agent's path in an `[agent …]` tag, on one line and clipped like a tool's name, with no
+/// bracket that could end the tag early; `?` when the line names none.
+fn agent_name(path: &str) -> String {
+    let name = clip_name(&path.replace(['[', ']'], ""), TOOL_NAME_CHARS);
+    if name.is_empty() { "?".into() } else { name }
 }
 
 /// A subagent call's type, from its `subagent_type` input.
@@ -1416,7 +1437,8 @@ mod tests {
                 "[result]",
                 "[result error]",
                 "[summary]",
-                "[subagent "
+                "[subagent ",
+                "[agent "
             ]
         );
 

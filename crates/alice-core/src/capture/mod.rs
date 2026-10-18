@@ -1265,6 +1265,56 @@ mod tests {
 
     const CODEX: AgentKind = AgentKind::Codex;
     const CODEX_SAMPLE: &[u8] = include_bytes!("../../tests/fixtures/capture/codex/sample-1.jsonl");
+    const CODEX_AGENTS: &[u8] =
+        include_bytes!("../../tests/fixtures/capture/codex/agent_messages.jsonl");
+
+    /// Follow-up 2: a multi-agent rollout (synthetic fixture) reads with no unrecognised or
+    /// bookkeeping line, and its agents' messages render inside the turn as
+    /// `[agent <author> → <recipient>]` blocks, in file order; an encrypted-only message leaves
+    /// nothing.
+    #[test]
+    fn codex_agent_messages_render_inside_their_turn() {
+        let forced = ReadOptions {
+            force_close: true,
+            ..opts(true, true)
+        };
+        let out = read(CODEX, CODEX_AGENTS, &forced);
+        assert_eq!(
+            (
+                out.stats.lines,
+                out.stats.unknown,
+                out.stats.bookkeeping,
+                out.stats.invalid
+            ),
+            (10, 0, 0, 0),
+            "{:?}",
+            out.stats
+        );
+        assert_eq!(out.turns.len(), 1);
+        let text = turn_text(&out.turns[0]);
+        let heads: Vec<&str> = text
+            .lines()
+            .map(|l| l.split(']').next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                "[user",
+                "[assistant",
+                "[agent /root/review_w1 → /root",
+                "[agent /root/review_w2 → /root",
+                "[assistant"
+            ],
+            "{text}"
+        );
+        assert!(text.contains(
+            "[agent /root/review_w2 → /root] Reviewer two: one finding, an empty text block"
+        ));
+        assert!(!text.contains("ZW5j") && !text.contains("b3Bh"), "{text}");
+        for line in text.lines() {
+            assert!(TAGS.iter().any(|t| line.starts_with(t)), "{line:?}");
+        }
+    }
 
     /// One rollout line: the envelope, then the payload.
     fn rollout(ts: &str, kind: &str, payload: serde_json::Value) -> Vec<u8> {
