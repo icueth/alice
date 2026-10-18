@@ -44,6 +44,16 @@ A Claude Code subagent's own transcript is a source of its own, linked to its se
 (`claude-code:session:<id>:agent:<agent-id>`). The source never stores a file path on a server, and keeps the project it
 was first captured in: a session that later `cd`s into another repository stays in the first one.
 
+**A subagent killed in its first run** (an app restart, a limit hit) never sends `SubagentStop`. Its session's events
+find it instead: Alice looks for the subagent transcripts Claude Code wrote beside the session's
+(`<session>/subagents/agent-<id>.jsonl`) that it has no source for, at most five per event, so a session with more is
+finished over later events. Locally that happens at each pass of the session and at the daemon's sweep; on a server
+tenant at the session's `Stop`, `PreCompact`, `SessionEnd` and `SessionStart`, and at every session start for every
+captured session. A subagent found this way follows the same rules as any source, the 6-hour close included, and a
+`SubagentStop` that comes later goes on from where it stopped. A Codex sub-agent writes a rollout of its own; its
+`SubagentStop` names it, and that rollout is its own source (`codex:session:<id>:agent:<agent-id>`). A Codex sub-agent
+killed before its `SubagentStop` is not found yet: its rollout lies in the date folders under its own thread id.
+
 **Exactly once.** Every stored turn records a key (the id of its first record). A turn whose key is already stored, in any
 source, is skipped. That covers a hook that fires twice, a daemon killed in the middle of a pass, a forked session that
 copies its parent's records into a new file, a replaced or truncated file, and a tenant script that lost its place.
