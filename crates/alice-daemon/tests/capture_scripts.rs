@@ -2414,6 +2414,129 @@ async fn a_close_is_sent_once_per_hold_and_a_resumed_session_goes_on() {
     assert_eq!(env.offset(sub_key), Some(tiny.len()));
 }
 
+/// A session whose only turn is longer than the script's first cap (2 MiB) and ends on a tool call
+/// with no result: its `Stop` doubles the cap to send it whole, and the server holds it.
+fn held_big_session(env: &Env, id: &str, cwd: &Path) -> Session {
+    let mut sess = Session::new(env, id, cwd);
+    let long = format!("{id}bigmarker ").repeat(2_400_000 / (id.len() + 11));
+    sess.tr
+        .prompt(&format!("{id}-p1"), "Read the whole log.")
+        .reply(&format!("{id}-a1"), &long)
+        .line(json!({"type": "assistant", "uuid": format!("{id}-a1b"),
+            "message": {"id": format!("msg-{id}-a1b"), "role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("toolu_{id}"), "name": "Bash",
+                 "input": {"command": format!("sleep {id}")}}]}}));
+    sess.flush();
+    assert!(sess.tr.len() > 2 << 20 && sess.tr.len() < 4 << 20);
+    env.hook(&sess.input("Stop"));
+    sess
+}
+
+/// Fix round 1, I1: a held turn longer than the first 2 MiB cap is taken by a session end, the
+/// sweep's close and the agent's own `SessionEnd` alike. The first capped body (`more=1`) takes
+/// nothing, and the doubled cap is sent past the hold too, whole, so the server closes the turn
+/// and ends the source. Before, the doubling stopped at the hold, and the close was marked done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_turn_over_the_first_cap_is_taken_by_a_close_and_by_session_end() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    let swept = held_big_session(&env, "bigswept", &cwd);
+    let ended = held_big_session(&env, "bigended", &cwd);
+    env.wait_idle();
+    for sess in [&swept, &ended] {
+        assert_eq!(
+            hold_of(&env, &sess.key()),
+            Some(sess.tr.len()),
+            "{}",
+            sess.id
+        );
+        assert_eq!(turns_of(&t.home, &uri(&sess.id)), 0);
+    }
+    let before = |id: &str| uploads(&s, id).len();
+    let (swept_before, ended_before) = (before("bigswept"), before("bigended"));
+
+    set_age(&swept.path, Duration::from_secs(7 * 3600));
+    env.hook(&Session::new(&env, "bignext", &cwd).input("SessionStart"));
+    env.hook(&ended.input("SessionEnd"));
+    env.wait_idle();
+    for (sess, n) in [(&swept, swept_before), (&ended, ended_before)] {
+        let ups = upload_sizes(&s, &sess.id)[n..].to_vec();
+        assert_eq!(
+            ups,
+            [(0, 2 << 20), (0, sess.tr.len() as usize)],
+            "{}: the capped body, then the whole turn\n{}",
+            sess.id,
+            env.log()
+        );
+        assert!(
+            uploads(&s, &sess.id)[n..]
+                .iter()
+                .all(|q| q["event"] == "session-end")
+        );
+        assert_eq!(turns_of(&t.home, &uri(&sess.id)), 1, "{}", sess.id);
+        assert_eq!(chunks_holding(&t.home, &format!("sleep {}", sess.id)), 1);
+        assert!(source_ended(&t.home, &uri(&sess.id)), "{}", sess.id);
+        assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
+        assert_eq!(hold_of(&env, &sess.key()), None);
+    }
+}
+
+/// Fix round 1, I2: a close the server answers while the tenant's capture rules wait (here its
+/// `config.toml` does not load: nothing is taken, nothing ends, and the answer says `waiting`) is
+/// not marked closed. Later sweeps send it again, and once the rules are known it is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_answered_while_the_rules_wait_is_sent_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AliceHome::new(dir.path().join("ann"));
+    home.ensure_dirs().unwrap();
+    std::fs::write(home.config_file(), "[capture\nenabled = tru").unwrap();
+    let s = Server::start_on("ann", home.clone()).await;
+    let t = s.tenant("ann");
+    assert!(t.svc.settings_handle().config_degraded());
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    let (sess, _) = held_session(&env, "heldwait", &cwd);
+    env.wait_idle();
+    assert_eq!(hold_of(&env, &sess.key()), Some(sess.tr.len()));
+    assert!(capture_row(&t.home, &uri("heldwait")).is_none());
+    set_age(&sess.path, Duration::from_secs(7 * 3600));
+    let closes = || {
+        uploads(&s, "heldwait")
+            .into_iter()
+            .filter(|q| q["event"] == "session-end")
+            .count()
+    };
+    for (i, next) in ["heldwait2", "heldwait3"].into_iter().enumerate() {
+        env.hook(&Session::new(&env, next, &cwd).input("SessionStart"));
+        env.wait_idle();
+        assert_eq!(closes(), i + 1, "{}", env.log());
+        let state = read(&env.state_file(&sess.key()));
+        assert!(!state.contains("\nclosed "), "{state}");
+        assert!(capture_row(&t.home, &uri("heldwait")).is_none());
+    }
+
+    std::fs::write(home.config_file(), "[capture]\nenabled = true\n").unwrap();
+    let waited = Instant::now();
+    while t.svc.settings_handle().config_degraded() || t.svc.settings_handle().loosening_waiting() {
+        assert!(
+            waited.elapsed() < Duration::from_secs(30),
+            "the config never loaded"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    env.hook(&Session::new(&env, "heldwait4", &cwd).input("SessionStart"));
+    env.wait_idle();
+    assert_eq!(closes(), 3, "{}", env.log());
+    assert_eq!(turns_of(&t.home, &uri("heldwait")), 2);
+    assert!(source_ended(&t.home, &uri("heldwait")));
+    assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
+    assert_eq!(hold_of(&env, &sess.key()), None);
+}
+
 /// Follow-up (capture gaps): a close the server never answered (it was down) is not counted as
 /// sent: the next sweep sends it again.
 #[tokio::test(flavor = "multi_thread")]
@@ -2447,6 +2570,80 @@ async fn an_unanswered_close_is_sent_again_by_the_next_sweep() {
     assert_eq!(ups[3]["event"], "session-end");
     assert_eq!(turns_of(&t.home, &uri("heldoff")), 2);
     assert!(source_ended(&t.home, &uri("heldoff")));
+}
+
+/// A held transcript of session `id` (one turn whose tool call has no result) with its state file
+/// (`hold` at its size), left alone for 7 hours: what the sweep closes.
+fn abandoned_state(env: &Env, id: &str, cwd: &Path) {
+    let mut sess = Session::new(env, id, cwd);
+    sess.tr
+        .prompt(&format!("{id}-p1"), "Run the long job.")
+        .line(json!({"type": "assistant", "uuid": format!("{id}-a1"),
+            "message": {"id": format!("msg-{id}-a1"), "role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("toolu_{id}"), "name": "Bash",
+                 "input": {"command": format!("sleep {id}")}}]}}));
+    sess.flush();
+    std::fs::create_dir_all(env.alice().join("state")).unwrap();
+    std::fs::write(
+        env.state_file(&sess.key()),
+        format!(
+            "0 {}\nsession {id}\ncwd {}\nhold {}\n",
+            sess.path.display(),
+            cwd.display(),
+            sess.tr.len()
+        ),
+    )
+    .unwrap();
+    set_age(&sess.path, Duration::from_secs(7 * 3600));
+}
+
+/// Fix round 1, review M3 and M4: a close takes one of the sweep's five places when it uploads,
+/// so six abandoned transcripts are closed five at one session start and the sixth at the next.
+/// A close that cannot run (another worker holds that transcript's lock) takes none, so five of
+/// them sorted first do not keep the sweep from the one behind them.
+#[tokio::test(flavor = "multi_thread")]
+async fn closes_take_the_sweeps_places_only_when_they_upload() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let ids: Vec<String> = (0..6).map(|i| format!("bclose{i}")).collect();
+    for id in &ids {
+        abandoned_state(&env, id, &cwd);
+    }
+    let closed =
+        |id: &str| capture_row(&t.home, &uri(id)).is_some() && source_ended(&t.home, &uri(id));
+    env.hook(&Session::new(&env, "bnext1", &cwd).input("SessionStart"));
+    env.wait_idle();
+    let sent: Vec<&String> = ids
+        .iter()
+        .filter(|id| !uploads(&s, id).is_empty())
+        .collect();
+    assert_eq!(sent.len(), 5, "{sent:?}\n{}", env.log());
+    assert!(sent.iter().all(|id| closed(id)));
+    env.hook(&Session::new(&env, "bnext2", &cwd).input("SessionStart"));
+    env.wait_idle();
+    assert!(ids.iter().all(|id| closed(id)), "{}", env.log());
+    assert!(ids.iter().all(|id| uploads(&s, id).len() == 1));
+
+    // Five closes another worker's live lock keeps from running, sorted before a sixth.
+    for i in 0..5 {
+        let id = format!("alocked{i}");
+        abandoned_state(&env, &id, &cwd);
+        let lock = env.alice().join(format!("state/claude-code-{id}.lock"));
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join("pid"), format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(lock.join("at"), format!("{}\n", now_secs())).unwrap();
+    }
+    abandoned_state(&env, "zfree", &cwd);
+    env.hook(&Session::new(&env, "bnext3", &cwd).input("SessionStart"));
+    env.wait_idle();
+    assert!(closed("zfree"), "{}", env.log());
+    for i in 0..5 {
+        assert!(uploads(&s, &format!("alocked{i}")).is_empty());
+    }
 }
 
 /// Follow-up (capture gaps): a hold already closed takes none of the sweep's five places, and the

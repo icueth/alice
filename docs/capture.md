@@ -656,6 +656,9 @@ Answers:
   one 8 MiB pass with no line end: skip that line and go on after it (a gap). `"ended": true` means this upload ended
   the session; `false` after a `session-end` means the end did not land (the project's rules waited, say), so send it
   again later. A client should treat a missing `ended` as `false`: servers before this release do not send it.
+  `"waiting": true` (sent only when set) means the project's capture rules are not known right now, so nothing was
+  taken in and nothing ended: send the same bytes again later, even if the file does not grow. The tenant script's
+  sweep does so for a close (below); a session that goes on is sent again by its next event.
 - `409 {"next_offset": N}`: the server's cursor is ahead of `offset`. Continue from `N`. A cursor beyond the end of the
   local file means the server already holds more of the session than the file has; the tenant script stops that
   session (`status` lists it as `stopped`).
@@ -666,5 +669,6 @@ Answers:
 The tenant script sends at most 2 MiB at a time, doubles the size (up to 8 MiB) when a capped body held no complete
 turn, adds `more=1` whenever a body is as long as its cap, and sends the empty `session-end` at most once per event. At
 a session start it also sweeps up to five other transcripts: one that grew while no event sent it, and one the server
-took nothing from (a hold) that has not changed for 6 hours, which it sends once as `session-end` (the session was left
-in the middle of a turn, and its own `SessionEnd` will never come).
+took nothing from (a hold) that has not changed for 6 hours, which it sends as `session-end` (the session was left in
+the middle of a turn, and its own `SessionEnd` will never come). It sends that close once per hold: again only when
+the server did not answer, or answered `"waiting": true`.

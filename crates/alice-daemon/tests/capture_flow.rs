@@ -991,6 +991,10 @@ async fn a_fail_closed_project_waits_and_keeps_the_cursor() {
     let a = send(&svc, local(q("fc", 0, "stop")), &t.bytes).await;
     assert_eq!(a.next_offset, 0, "the cursor stays where it was");
     assert_eq!((a.turns_stored, a.chunks_stored), (0, 0));
+    assert!(
+        a.waiting,
+        "the answer says the rules wait (fix round 1, I2)"
+    );
     assert!(state_of(&svc, &uri("fc")).is_none(), "nothing is stored");
     assert!(known_keys(&svc).is_empty(), "no key is recorded");
 
@@ -1005,6 +1009,9 @@ async fn a_fail_closed_project_waits_and_keeps_the_cursor() {
         let a = send(&svc, local(q("fc", 0, "stop")), &t.bytes).await;
         if a.turns_stored > 0 {
             assert_eq!((a.turns_stored, a.next_offset), (2, t.len()));
+            assert!(!a.waiting);
+            let json = serde_json::to_string(&a).unwrap();
+            assert!(!json.contains("waiting"), "sent only when set: {json}");
             break;
         }
         assert_eq!(a.next_offset, 0);

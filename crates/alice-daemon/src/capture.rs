@@ -169,6 +169,7 @@ impl PassReport {
             chunks_stored: self.chunks_stored,
             oversized_line: self.oversized_line,
             ended: self.ended,
+            waiting: matches!(self.verdict, Some(CaptureVerdict::Wait(_))),
         }
     }
 

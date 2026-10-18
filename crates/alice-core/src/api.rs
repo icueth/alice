@@ -826,8 +826,8 @@ pub struct TranscriptAnswer {
     /// are fail-closed for now (the upload waits, nothing is stored or skipped), a new
     /// subagent's transcript is still too short to judge as a whole, or the body holds no
     /// complete turn. The client keeps that offset and does not send again until the file has
-    /// grown (its next hook event). An `oversized_line` answer equals it too, but there the
-    /// client skips the line.
+    /// grown (its next hook event), unless `waiting` says the rules wait. An `oversized_line`
+    /// answer equals it too, but there the client skips the line.
     pub next_offset: u64,
     pub turns_stored: u64,
     /// Turns that were stored already, or not stored by the rules (an excluded project, or a
@@ -841,6 +841,12 @@ pub struct TranscriptAnswer {
     /// (the project's rules wait, say), so the client knows the end did not land.
     #[serde(default)]
     pub ended: bool,
+    /// The project's capture rules are not known right now (they fail closed: a configuration
+    /// that does not load, or a change still settling), so nothing was taken in and nothing
+    /// ended. Send the same bytes again later, even when the file does not grow: a session end
+    /// that met this has not landed. Sent only when set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub waiting: bool,
 }
 
 /// `POST /api/v1/capture/notify` (SP2 spec §4.1, §4.2): an agent hook fired, so the local

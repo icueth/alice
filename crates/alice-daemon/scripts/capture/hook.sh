@@ -596,6 +596,7 @@ post() {
 capture_one() {
   co_key=$1
   co_event=$2
+  co_sent= # set once this call has uploaded something (the sweep counts its places by it)
   co_st="$STATE/$co_key.offset"
   if ! lock "$co_key" "$7"; then
     if [ "$7" -gt 0 ]; then
@@ -661,7 +662,9 @@ capture_one() {
   if [ -n "$s_corrupt" ]; then
     log "session $3: the state file held a corrupt value ($s_corrupt); asking the server where to resume"
   fi
-  # SessionEnd closes a trailing turn the server waited on, so it may send once past a hold.
+  # SessionEnd closes a trailing turn the server waited on, so it may send past a hold: in every
+  # pass of this call, the cap-doubling retries of the held offset included (any other pass that
+  # goes on has moved past the hold and cleared it).
   co_bypass=
   if [ "$co_event" = session-end ]; then co_bypass=1; fi
   co_pass=0
@@ -671,6 +674,7 @@ capture_one() {
   co_ended=
   co_empty_sent=
   co_answered=
+  co_waiting=
   while [ "$co_pass" -lt "$PASSES" ]; do
     co_pass=$((co_pass + 1))
     co_empty=
@@ -698,7 +702,6 @@ capture_one() {
     if [ -n "$s_hold" ] && [ "$co_size" -le "$s_hold" ] && [ -z "$co_bypass" ]; then
       break
     fi
-    co_bypass=
     if [ -n "$co_empty" ]; then
       { : >"$tmpd/body"; } 2>/dev/null
     else
@@ -711,6 +714,7 @@ capture_one() {
     # body's last turn open.
     if [ "$co_n" -ge "$co_cap" ]; then co_q="$co_q&more=1"; fi
     if [ -n "$4" ]; then co_q="$co_q&subagent=$4"; fi
+    co_sent=1
     co_code=$(post "$co_q")
     co_rc=$?
     co_next=$(sed -n 's/.*"next_offset"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$tmpd/answer" 2>/dev/null | head -n 1)
@@ -764,6 +768,14 @@ capture_one() {
             break
             ;;
         esac
+        if [ "$co_next" -eq "$s_off" ] &&
+          grep -q '"waiting"[[:space:]]*:[[:space:]]*true' "$tmpd/answer" 2>/dev/null; then
+          # The server's capture rules for this project wait: nothing was taken, whatever the
+          # size. Held until the transcript grows, and a sweep's close is sent again.
+          log "session $3: the server took nothing from offset $s_off ($co_event): its capture rules for this project wait; it is sent again later"
+          co_waiting=1 s_hold=$co_size
+          break
+        fi
         if [ "$co_next" -eq "$s_off" ] && [ "$co_n" -ge "$co_cap" ] && [ "$co_cap" -lt "$BODY_MAX" ]; then
           # A capped body held no whole turn (or no line end): twice the cap, same offset.
           co_cap=$((co_cap * 2))
@@ -845,8 +857,9 @@ capture_one() {
     co_pending=1 # out of passes with bytes left
   fi
   # A close is sent once per hold: once the server answered it, a hold it leaves (it took nothing
-  # either, or refused it) is closed. Unanswered (the server down), the next sweep sends it again.
-  if [ -n "$co_close" ] && [ -n "$co_answered" ]; then s_closed=$s_hold; fi
+  # either, or refused it) is closed. Unanswered (the server down), or answered while the
+  # server's rules wait (nothing taken, nothing ended), the next sweep sends it again.
+  if [ -n "$co_close" ] && [ -n "$co_answered" ] && [ -z "$co_waiting" ]; then s_closed=$s_hold; fi
   if save_state "$co_st" && [ -n "$co_pending" ]; then mark_pending "$co_st"; fi
   unlock
   return 0
@@ -883,8 +896,12 @@ sweep() {
     if [ -n "$s_hold" ] && [ "$sw_size" -le "$s_hold" ] && [ "$sw_size" -gt "$s_off" ] &&
       [ "$s_closed" != "$s_hold" ] && abandoned "$s_path"; then
       capture_one "$sw_key" session-end "$s_session" "$s_sub" "$s_path" "$s_cwd" 0 "$s_hold"
-      sw_n=$((sw_n + 1))
-      [ "$sw_n" -lt "$SWEEP_MAX" ] || break
+      # A place only for a close that uploaded: one another worker's lock, an unreadable
+      # .alice.toml or the recheck kept back never resolves by itself.
+      if [ -n "$co_sent" ]; then
+        sw_n=$((sw_n + 1))
+        [ "$sw_n" -lt "$SWEEP_MAX" ] || break
+      fi
       continue
     fi
     # Untouched since its state was written (and no work left, see mark_pending): skip.
